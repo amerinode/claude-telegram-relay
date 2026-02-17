@@ -83,13 +83,15 @@ async function installService(config: ServiceDef): Promise<boolean> {
   // Stop existing first
   await run(["npx", "pm2", "delete", config.name]);
 
+  // Use "pm2 start bun -- run <script>" to avoid PM2's broken Bun container
+  // which uses require() and fails on async modules (top-level await)
   const result = await run([
-    "npx", "pm2", "start", config.script,
-    "--interpreter", "bun",
+    "npx", "pm2", "start", "bun",
     "--name", config.name,
     "--cwd", PROJECT_ROOT,
     "-o", join(LOGS_DIR, `${config.name}.log`),
     "-e", join(LOGS_DIR, `${config.name}.error.log`),
+    "--", "run", config.script,
   ]);
 
   if (result.ok) {

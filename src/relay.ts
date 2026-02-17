@@ -7,12 +7,13 @@
  * Run: bun run src/relay.ts
  */
 
-import { Bot, Context } from "grammy";
+import { Bot, Context, InputFile } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
+import { synthesize } from "./tts.ts";
 import {
   processMemoryIntents,
   getMemoryContext,
@@ -199,14 +200,16 @@ async function callClaude(
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
 
   try {
+    // Strip Claude Code env vars to avoid nesting detection
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.CLAUDECODE;
+    delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+
     const proc = spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
       cwd: PROJECT_DIR || undefined,
-      env: {
-        ...process.env,
-        // Pass through any env vars Claude might need
-      },
+      env: cleanEnv,
     });
 
     const output = await new Response(proc.stdout).text();
@@ -305,7 +308,16 @@ bot.on("message:voice", async (ctx) => {
     const claudeResponse = await processMemoryIntents(supabase, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
-    await sendResponse(ctx, claudeResponse);
+
+    // TTS: reply with voice only when user sent voice
+    await ctx.replyWithChatAction("upload_voice");
+    const audio = await synthesize(claudeResponse);
+    if (audio) {
+      await ctx.replyWithVoice(new InputFile(audio, "response.ogg"));
+    } else {
+      // Fallback to text if TTS fails
+      await sendResponse(ctx, claudeResponse);
+    }
   } catch (error) {
     console.error("Voice error:", error);
     await ctx.reply("Could not process voice message. Check logs for details.");
@@ -422,6 +434,7 @@ function buildPrompt(
 
   const parts = [
     "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+    "IMPORTANT: Always reply in the same language the user is writing or speaking in. Match their language exactly.",
   ];
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);

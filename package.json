@@ -9,14 +9,16 @@
     "test:telegram": "bun run setup/test-telegram.ts",
     "test:supabase": "bun run setup/test-supabase.ts",
     "test:voice": "bun run setup/test-voice.ts",
+    "test:tts": "bun run setup/test-tts.ts",
     "setup:launchd": "bun run setup/configure-launchd.ts",
     "setup:services": "bun run setup/configure-services.ts",
     "setup:verify": "bun run setup/verify.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^17.3.1",
     "grammy": "^1.21.1",
-    "groq-sdk": "^0.8.0"
+    "groq-sdk": "^0.37.0"
   },
   "devDependencies": {
     "@types/bun": "latest"
