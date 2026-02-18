@@ -359,6 +359,7 @@ export async function createDraft(params: {
       body: { contentType: "Text", content: params.body },
       toRecipients: params.to.map(addr => ({ emailAddress: { address: addr } })),
       ccRecipients: (params.cc || []).map(addr => ({ emailAddress: { address: addr } })),
+      isDraft: true,
     },
   }) as any;
 

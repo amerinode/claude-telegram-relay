@@ -355,8 +355,8 @@ async function processMs365Actions(response: string): Promise<string> {
     }
   }
 
-  // [SEND_EMAIL: to | subject | body]
-  for (const match of response.matchAll(/\[SEND_EMAIL:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+  // [SEND_EMAIL: to | subject | body] — body can span multiple lines
+  for (const match of response.matchAll(/\[SEND_EMAIL:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi)) {
     try {
       await sendEmail({
         to: [match[1].trim()],
@@ -371,8 +371,8 @@ async function processMs365Actions(response: string): Promise<string> {
     }
   }
 
-  // [CREATE_DRAFT: to | subject | body]
-  for (const match of response.matchAll(/\[CREATE_DRAFT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+  // [CREATE_DRAFT: to | subject | body] — body can span multiple lines
+  for (const match of response.matchAll(/\[CREATE_DRAFT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi)) {
     try {
       const result = await createDraft({
         to: [match[1].trim()],
