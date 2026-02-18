@@ -362,6 +362,8 @@ export async function createDraft(params: {
     },
   }) as any;
 
+  console.log("Draft created — isDraft:", result.isDraft, "id:", result.id);
+
   return { id: result.id, subject: result.subject };
 }
 
