@@ -29,6 +29,7 @@ import {
   sendEmail,
   createDraft,
 } from "./ms365.ts";
+import { generateDocx } from "./document.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -391,6 +392,53 @@ async function processMs365Actions(response: string): Promise<string> {
 }
 
 // ============================================================
+// DOCUMENT GENERATION & SENDING
+// ============================================================
+
+/**
+ * Process [SEND_DOCUMENT: filename | title | content...] tags in Claude's response.
+ * Generates a .docx file and sends it via Telegram, then strips the tag from the response.
+ */
+async function processDocumentActions(
+  ctx: Context,
+  response: string
+): Promise<string> {
+  let clean = response;
+
+  // [SEND_DOCUMENT: filename.docx | Document Title | markdown content...]
+  // Content can span multiple lines, so use [\s\S]+? (non-greedy)
+  const docRegex = /\[SEND_DOCUMENT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi;
+
+  for (const match of response.matchAll(docRegex)) {
+    const rawFilename = match[1].trim();
+    const title = match[2].trim();
+    const content = match[3].trim();
+
+    // Ensure .docx extension
+    const filename = rawFilename.endsWith(".docx") ? rawFilename : `${rawFilename}.docx`;
+
+    try {
+      console.log(`Generating document: ${filename} ("${title}")`);
+      await ctx.replyWithChatAction("upload_document");
+
+      const docBuffer = await generateDocx(content, title);
+      await ctx.replyWithDocument(new InputFile(docBuffer, filename));
+
+      console.log(`Sent document: ${filename} (${docBuffer.length} bytes)`);
+      clean = clean.replace(match[0], "");
+    } catch (error: any) {
+      console.error("Document generation error:", error.message);
+      clean = clean.replace(
+        match[0],
+        `(Could not generate document: ${error.message})`
+      );
+    }
+  }
+
+  return clean;
+}
+
+// ============================================================
 // MESSAGE HANDLERS
 // ============================================================
 
@@ -425,8 +473,11 @@ bot.on("message:text", async (ctx) => {
   // Always check — Claude may emit action tags even without explicit ms365Context
   const afterActions = await processMs365Actions(rawResponse);
 
+  // Process document generation tags — sends files via Telegram
+  const afterDocs = await processDocumentActions(ctx, afterActions);
+
   // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, afterActions);
+  const response = await processMemoryIntents(supabase, afterDocs);
 
   await saveMessage("assistant", response);
   await sendResponse(ctx, response);
@@ -484,7 +535,8 @@ bot.on("message:voice", async (ctx) => {
     );
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
     const afterActions = await processMs365Actions(rawResponse);
-    const claudeResponse = await processMemoryIntents(supabase, afterActions);
+    const afterDocs = await processDocumentActions(ctx, afterActions);
+    const claudeResponse = await processMemoryIntents(supabase, afterDocs);
 
     await saveMessage("assistant", claudeResponse);
 
@@ -535,7 +587,8 @@ bot.on("message:photo", async (ctx) => {
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const afterDocs = await processDocumentActions(ctx, claudeResponse);
+    const cleanResponse = await processMemoryIntents(supabase, afterDocs);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -571,7 +624,8 @@ bot.on("message:document", async (ctx) => {
 
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const afterDocs = await processDocumentActions(ctx, claudeResponse);
+    const cleanResponse = await processMemoryIntents(supabase, afterDocs);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -646,6 +700,17 @@ function buildPrompt(
         "\nSummarize emails concisely rather than showing raw data."
     );
   }
+
+  parts.push(
+    "\nDOCUMENT GENERATION:" +
+      "\nYou CAN generate and send Word documents (.docx) directly in Telegram!" +
+      "\nWhen the user asks you to create, write, or send a document/file/Word doc, include this tag:" +
+      "\n[SEND_DOCUMENT: filename.docx | Document Title | full document content in markdown]" +
+      "\nThe content supports: # headings, **bold**, *italic*, - bullet lists, 1. numbered lists, and | tables |." +
+      "\nThe document is generated and sent as a .docx file attachment in Telegram automatically." +
+      "\nWrite the full document content inside the tag — do NOT say you can't create files." +
+      "\nExample: [SEND_DOCUMENT: proposal.docx | Business Proposal | # Introduction\\n\\nThis proposal outlines...\\n\\n## Key Points\\n\\n- Point one\\n- Point two]"
+  );
 
   parts.push(
     "\nMEMORY MANAGEMENT:" +

@@ -17,6 +17,7 @@
   "dependencies": {
     "@google-cloud/text-to-speech": "^6.4.0",
     "@supabase/supabase-js": "^2.45.0",
+    "docx": "^9.5.3",
     "dotenv": "^17.3.1",
     "grammy": "^1.21.1",
     "groq-sdk": "^0.37.0"
