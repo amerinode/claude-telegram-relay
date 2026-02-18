@@ -421,8 +421,9 @@ bot.on("message:text", async (ctx) => {
   const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context);
   const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
 
-  // Process MS365 action tags (create event, accept, send email, etc.)
-  const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
+  // Process MS365 action tags (create event, accept, send email, draft, etc.)
+  // Always check — Claude may emit action tags even without explicit ms365Context
+  const afterActions = await processMs365Actions(rawResponse);
 
   // Parse and save any memory intents, strip tags from response
   const response = await processMemoryIntents(supabase, afterActions);
@@ -482,7 +483,7 @@ bot.on("message:voice", async (ctx) => {
       ms365Context
     );
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
-    const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
+    const afterActions = await processMs365Actions(rawResponse);
     const claudeResponse = await processMemoryIntents(supabase, afterActions);
 
     await saveMessage("assistant", claudeResponse);
