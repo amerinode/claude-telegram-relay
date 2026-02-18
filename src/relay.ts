@@ -18,7 +18,17 @@ import {
   processMemoryIntents,
   getMemoryContext,
   getRelevantContext,
+  getRecentHistory,
 } from "./memory.ts";
+import {
+  handleMs365Request,
+  listCalendarEvents,
+  createCalendarEvent,
+  acceptCalendarEvent,
+  declineCalendarEvent,
+  sendEmail,
+  createDraft,
+} from "./ms365.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -186,18 +196,24 @@ bot.use(async (ctx, next) => {
 
 async function callClaude(
   prompt: string,
-  options?: { resume?: boolean; imagePath?: string }
+  options?: { imagePath?: string; userMessage?: string }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
+  // Build the base Claude CLI arguments
+  const claudeArgs = ["-p", prompt, "--no-session-persistence", "--output-format", "text"];
 
-  // Resume previous session if available and requested
-  if (options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
+  // Allow web access tools based on configured search provider
+  const allowedTools = ["WebFetch", "WebSearch"];
+  const searchProvider = process.env.SEARCH_PROVIDER || "brave";
+  if (searchProvider === "brave") {
+    allowedTools.push("mcp__brave-search__brave_web_search", "mcp__brave-search__brave_local_search");
+  } else if (searchProvider === "perplexity") {
+    allowedTools.push("mcp__perplexity__perplexity_search", "mcp__perplexity__perplexity_ask", "mcp__perplexity__perplexity_research", "mcp__perplexity__perplexity_reason");
   }
 
-  args.push("--output-format", "text");
+  claudeArgs.push("--allowedTools", ...allowedTools);
 
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`Allowed tools: ${allowedTools.join(", ")}`);
 
   try {
     // Strip Claude Code env vars to avoid nesting detection
@@ -205,7 +221,9 @@ async function callClaude(
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
 
-    const proc = spawn(args, {
+    const spawnArgs = [CLAUDE_PATH, ...claudeArgs];
+
+    const proc = spawn(spawnArgs, {
       stdout: "pipe",
       stderr: "pipe",
       cwd: PROJECT_DIR || undefined,
@@ -218,16 +236,9 @@ async function callClaude(
     const exitCode = await proc.exited;
 
     if (exitCode !== 0) {
-      console.error("Claude error:", stderr);
+      console.error(`Claude exit code: ${exitCode}`);
+      console.error(`Claude stderr: ${stderr.substring(0, 500)}`);
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
-    }
-
-    // Extract session ID from output if present (for --resume)
-    const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
-    if (sessionMatch) {
-      session.sessionId = sessionMatch[1];
-      session.lastActivity = new Date().toISOString();
-      await saveSession(session);
     }
 
     return output.trim();
@@ -235,6 +246,148 @@ async function callClaude(
     console.error("Spawn error:", error);
     return `Error: Could not run Claude CLI`;
   }
+}
+
+// ============================================================
+// MS365 DETECTION & ACTION PROCESSING
+// ============================================================
+
+/**
+ * Check if a user message requires MS365 (email/calendar) data.
+ * Uses action-oriented patterns to avoid false positives when
+ * the user merely *mentions* email/calendar in conversation.
+ */
+function needsMs365(message: string): boolean {
+  if (process.env.MS365_ENABLED !== "true") return false;
+
+  const ms365ActionPatterns = [
+    // Email actions: fetch, read, check, show, open, list, send, delete, forward
+    /\b(show|read|check|fetch|list|open|get|find|search|send|forward|reply|delete|move|compose|draft|write)\b.{0,20}\b(emails?|e-mails?|mails?|inbox|messages?)\b/i,
+    /\b(emails?|e-mails?|mails?|inbox)\b.{0,20}\b(from|to|today|this week|unread|latest|recent|new)\b/i,
+    /\b(enviar|ler|buscar|mostrar|abrir|verificar|checar|mandar)\b.{0,20}\b(emails?|e-mails?)\b/i,
+    // Calendar actions: check, show, what's on, schedule, add, create, cancel
+    /\b(show|check|what'?s on|list|open|get|add|create|schedule|cancel|remove|move|reschedule|book)\b.{0,20}\b(calendars?|schedule|agenda|meetings?|events?|appointments?|lunch|dinner|call)\b/i,
+    /\b(add|create|schedule|book|set up|cancel|reschedule)\b.{0,30}\b(at|for|on|today|tomorrow|noon|morning|afternoon)\b/i,
+    /\b(next|upcoming|today'?s?|this week'?s?)\b.{0,20}\b(meetings?|events?|appointments?|calls?)\b/i,
+    /\b(meetings?|events?|appointments?)\b.{0,20}\b(today|this week|tomorrow|scheduled)\b/i,
+    /\b(calend[aá]rios?|agendas?|reuni[aãõ]o|reuni[oõ]es|eventos?)\b.{0,20}\b(hoje|semana|próxim|agendar|criar|adicionar|cancelar)\b/i,
+    /\b(agendar|marcar|criar|adicionar)\b.{0,30}\b(reuni|almoço|jantar|chamada|evento)\b/i,
+    // Draft actions
+    /\b(add|save|put|move).{0,15}(to\s+)?drafts?\b/i,
+    /\b(create|write|compose)\b.{0,15}\bdrafts?\b/i,
+    // Direct commands
+    /\b(my (latest|recent|unread|new) (emails?|mails?))\b/i,
+    /\b(my (calendar|schedule|agenda|meetings?))\b/i,
+    /\bwhen is my next\b/i,
+    /\binbox\b/i,
+    /\boutlook\b/i,
+    /\b(add|put).{0,15}(calendar|my cal)\b/i,
+    // Confirm/accept meetings
+    /\b(accept|confirm|rsvp|decline)\b.{0,20}\b(meeting|event|invite|calendar)\b/i,
+  ];
+
+  return ms365ActionPatterns.some(p => p.test(message));
+}
+
+/**
+ * Process MS365 action tags in Claude's response.
+ * Claude can include these tags to trigger real actions:
+ *   [CREATE_EVENT: subject | start_datetime | end_datetime | timezone]
+ *   [ACCEPT_EVENT: event_subject_search_text]
+ *   [DECLINE_EVENT: event_subject_search_text]
+ *   [SEND_EMAIL: to@addr | subject | body]
+ */
+async function processMs365Actions(response: string): Promise<string> {
+  let clean = response;
+
+  // [CREATE_EVENT: subject | start | end | timezone]
+  for (const match of response.matchAll(/\[CREATE_EVENT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*(?:\|\s*(.+?))?\]/gi)) {
+    try {
+      const result = await createCalendarEvent({
+        subject: match[1].trim(),
+        startDateTime: match[2].trim(),
+        endDateTime: match[3].trim(),
+        timeZone: match[4]?.trim(),
+      });
+      console.log(`Created calendar event: ${result.subject} (${result.id})`);
+      clean = clean.replace(match[0], `✅ Event created: ${result.subject}`);
+    } catch (error: any) {
+      console.error("Create event error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not create event: ${error.message}`);
+    }
+  }
+
+  // [ACCEPT_EVENT: search text]
+  for (const match of response.matchAll(/\[ACCEPT_EVENT:\s*(.+?)\]/gi)) {
+    try {
+      const events = await listCalendarEvents();
+      const searchText = match[1].trim().toLowerCase();
+      const event = events.find(e => e.subject.toLowerCase().includes(searchText));
+      if (event) {
+        await acceptCalendarEvent(event.id);
+        console.log(`Accepted event: ${event.subject}`);
+        clean = clean.replace(match[0], `✅ Accepted: ${event.subject}`);
+      } else {
+        clean = clean.replace(match[0], `❌ Could not find event matching "${match[1].trim()}"`);
+      }
+    } catch (error: any) {
+      console.error("Accept event error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not accept event: ${error.message}`);
+    }
+  }
+
+  // [DECLINE_EVENT: search text]
+  for (const match of response.matchAll(/\[DECLINE_EVENT:\s*(.+?)\]/gi)) {
+    try {
+      const events = await listCalendarEvents();
+      const searchText = match[1].trim().toLowerCase();
+      const event = events.find(e => e.subject.toLowerCase().includes(searchText));
+      if (event) {
+        await declineCalendarEvent(event.id);
+        console.log(`Declined event: ${event.subject}`);
+        clean = clean.replace(match[0], `✅ Declined: ${event.subject}`);
+      } else {
+        clean = clean.replace(match[0], `❌ Could not find event matching "${match[1].trim()}"`);
+      }
+    } catch (error: any) {
+      console.error("Decline event error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not decline event: ${error.message}`);
+    }
+  }
+
+  // [SEND_EMAIL: to | subject | body]
+  for (const match of response.matchAll(/\[SEND_EMAIL:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+    try {
+      await sendEmail({
+        to: [match[1].trim()],
+        subject: match[2].trim(),
+        body: match[3].trim(),
+      });
+      console.log(`Sent email to: ${match[1].trim()}`);
+      clean = clean.replace(match[0], `✅ Email sent to ${match[1].trim()}`);
+    } catch (error: any) {
+      console.error("Send email error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not send email: ${error.message}`);
+    }
+  }
+
+  // [CREATE_DRAFT: to | subject | body]
+  for (const match of response.matchAll(/\[CREATE_DRAFT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+    try {
+      const result = await createDraft({
+        to: [match[1].trim()],
+        subject: match[2].trim(),
+        body: match[3].trim(),
+      });
+      console.log(`Created draft: ${result.subject} (${result.id})`);
+      clean = clean.replace(match[0], `✅ Draft saved: "${result.subject}" — check your Outlook Drafts folder`);
+    } catch (error: any) {
+      console.error("Create draft error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not create draft: ${error.message}`);
+    }
+  }
+
+  return clean;
 }
 
 // ============================================================
@@ -250,17 +403,29 @@ bot.on("message:text", async (ctx) => {
 
   await saveMessage("user", text);
 
-  // Gather context: semantic search + facts/goals
-  const [relevantContext, memoryContext] = await Promise.all([
+  // Gather context: recent history + semantic search + facts/goals
+  const [recentHistory, relevantContext, memoryContext] = await Promise.all([
+    getRecentHistory(supabase, 20),
     getRelevantContext(supabase, text),
     getMemoryContext(supabase),
   ]);
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+  // Check if we need MS365 data (email/calendar)
+  let ms365Context = "";
+  if (needsMs365(text)) {
+    console.log("MS365 request detected, fetching data via Graph API...");
+    ms365Context = await handleMs365Request(text, recentHistory);
+    console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
+  }
+
+  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context);
+  const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
+
+  // Process MS365 action tags (create event, accept, send email, etc.)
+  const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
 
   // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, rawResponse);
+  const response = await processMemoryIntents(supabase, afterActions);
 
   await saveMessage("assistant", response);
   await sendResponse(ctx, response);
@@ -286,32 +451,45 @@ bot.on("message:voice", async (ctx) => {
     const response = await fetch(url);
     const buffer = Buffer.from(await response.arrayBuffer());
 
-    const transcription = await transcribe(buffer);
-    if (!transcription) {
+    const result = await transcribe(buffer);
+    if (!result.text) {
       await ctx.reply("Could not transcribe voice message.");
       return;
     }
 
+    const { text: transcription, language: detectedLang } = result;
+
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
-    const [relevantContext, memoryContext] = await Promise.all([
+    const [recentHistory, relevantContext, memoryContext] = await Promise.all([
+      getRecentHistory(supabase, 20),
       getRelevantContext(supabase, transcription),
       getMemoryContext(supabase),
     ]);
 
+    // Check if we need MS365 data (email/calendar)
+    let ms365Context = "";
+    if (needsMs365(transcription)) {
+      console.log("MS365 request detected in voice, fetching data via Graph API...");
+      ms365Context = await handleMs365Request(transcription, recentHistory);
+    }
+
     const enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
-      memoryContext
+      memoryContext,
+      recentHistory,
+      ms365Context
     );
-    const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = await processMemoryIntents(supabase, rawResponse);
+    const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
+    const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
+    const claudeResponse = await processMemoryIntents(supabase, afterActions);
 
     await saveMessage("assistant", claudeResponse);
 
-    // TTS: reply with voice only when user sent voice
+    // TTS: reply with voice, matching the user's spoken language
     await ctx.replyWithChatAction("upload_voice");
-    const audio = await synthesize(claudeResponse);
+    const audio = await synthesize(claudeResponse, detectedLang);
     if (audio) {
       await ctx.replyWithVoice(new InputFile(audio, "response.ogg"));
     } else {
@@ -351,7 +529,7 @@ bot.on("message:photo", async (ctx) => {
 
     await saveMessage("user", `[Image]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, { userMessage: caption });
 
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
@@ -388,7 +566,7 @@ bot.on("message:document", async (ctx) => {
 
     await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, { userMessage: caption });
 
     await unlink(filePath).catch(() => {});
 
@@ -419,7 +597,9 @@ const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolve
 function buildPrompt(
   userMessage: string,
   relevantContext?: string,
-  memoryContext?: string
+  memoryContext?: string,
+  recentHistory?: string,
+  ms365Context?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -435,6 +615,8 @@ function buildPrompt(
   const parts = [
     "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
     "IMPORTANT: Always reply in the same language the user is writing or speaking in. Match their language exactly.",
+    "VOICE: When you receive a voice message transcription, just respond to the content naturally with text. " +
+      "The system automatically converts your text response to a voice message via TTS — do NOT mention voice capabilities or limitations.",
   ];
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
@@ -442,6 +624,27 @@ function buildPrompt(
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
+  if (recentHistory) parts.push(`\n${recentHistory}`);
+
+  // MS365 data (emails, calendar) fetched directly from Microsoft Graph API
+  if (ms365Context) {
+    parts.push(`\nMICROSOFT 365 DATA:\n${ms365Context}`);
+    parts.push(
+      "\nMS365 ACTIONS:" +
+        "\nWhen the user asks you to take actions on their email or calendar, include these tags:" +
+        "\n[CREATE_EVENT: subject | start_datetime (ISO) | end_datetime (ISO) | timezone]" +
+        "\n  Example: [CREATE_EVENT: Lunch with Niki | 2026-02-18T12:00:00 | 2026-02-18T13:00:00 | America/New_York]" +
+        "\n[ACCEPT_EVENT: event subject text to search]" +
+        "\n[DECLINE_EVENT: event subject text to search]" +
+        "\n[SEND_EMAIL: recipient@email.com | Subject line | Email body text]" +
+        "\n[CREATE_DRAFT: recipient@email.com | Subject line | Email body text]" +
+        "\n  Use CREATE_DRAFT when the user asks to save a draft, add to drafts, or write an email without sending it." +
+        "\nThese tags are processed automatically — include them in your response along with a human-friendly confirmation." +
+        "\nAlways CONFIRM with the user before sending emails or making calendar changes." +
+        "\nFor drafts, you can save directly when the user asks — no confirmation needed since it doesn't send anything." +
+        "\nSummarize emails concisely rather than showing raw data."
+    );
+  }
 
   parts.push(
     "\nMEMORY MANAGEMENT:" +
