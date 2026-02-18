@@ -115,6 +115,40 @@ export async function getMemoryContext(
 }
 
 /**
+ * Get the most recent conversation messages for short-term context.
+ * This provides conversational continuity — the bot can see what was just discussed.
+ */
+export async function getRecentHistory(
+  supabase: SupabaseClient | null,
+  limit: number = 20
+): Promise<string> {
+  if (!supabase) return "";
+
+  try {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("role, content, created_at")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error || !data?.length) return "";
+
+    // Reverse to chronological order (oldest first)
+    const messages = data.reverse();
+
+    return (
+      "RECENT CONVERSATION:\n" +
+      messages
+        .map((m: any) => `[${m.role}]: ${m.content}`)
+        .join("\n")
+    );
+  } catch (error) {
+    console.error("Recent history error:", error);
+    return "";
+  }
+}
+
+/**
  * Semantic search for relevant past messages via the search Edge Function.
  * The Edge Function handles embedding generation (OpenAI key stays in Supabase).
  */

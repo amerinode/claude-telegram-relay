@@ -11,6 +11,10 @@ bun.lockb
 # Personal config (keep examples, ignore actual)
 config/profile.md
 config/schedule.json
+config/google-tts-credentials.json
+
+# Claude Code worktrees & local settings
+.claude/
 
 # Runtime files
 *.lock

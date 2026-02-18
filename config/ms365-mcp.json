@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ms365": {
+      "command": "npx",
+      "args": ["-y", "@softeria/ms-365-mcp-server", "--preset", "mail,calendar"],
+      "env": {
+        "MS365_MCP_CLIENT_ID": "4e867585-b915-4309-8683-7e5b2df4513c",
+        "MS365_MCP_TENANT_ID": "c5076972-58d0-45f3-bc1c-25cd8d4821ed"
+      }
+    }
+  }
+}
