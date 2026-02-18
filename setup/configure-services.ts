@@ -137,7 +137,26 @@ async function main() {
   // Save PM2 config for auto-restart on reboot
   await run(["npx", "pm2", "save"]);
   console.log("");
-  console.log(`  ${dim("Auto-start on boot:")} npx pm2 startup`);
+
+  if (process.platform === "win32") {
+    // pm2 startup doesn't work on Windows — use the Startup folder instead
+    console.log(`  ${bold("Auto-start on boot (Windows):")}`);
+    const pm2Path = (await run(["where", "pm2.cmd"])).stdout.split("\n")[0]?.trim();
+    if (pm2Path) {
+      const startupDir = join(process.env.APPDATA || "", "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
+      const vbsPath = join(startupDir, "pm2-startup.vbs");
+      const vbsContent = `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run "cmd /c ""${pm2Path}"" resurrect", 0, False\n`;
+      await Bun.write(vbsPath, vbsContent);
+      console.log(`  ${PASS} PM2 auto-start configured (Windows Startup folder)`);
+      console.log(`      ${dim(vbsPath)}`);
+    } else {
+      console.log(`  ${FAIL} Could not find pm2.cmd — auto-start not configured`);
+      console.log(`      ${dim("Ensure PM2 is installed globally: npm install -g pm2")}`);
+    }
+  } else {
+    console.log(`  ${dim("Auto-start on boot:")} npx pm2 startup`);
+  }
+
   console.log(`  ${dim("Check status:")}        npx pm2 status`);
   console.log(`  ${dim("View logs:")}           npx pm2 logs`);
   console.log("");

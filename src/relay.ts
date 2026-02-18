@@ -30,6 +30,8 @@ import {
   createDraft,
 } from "./ms365.ts";
 import { generateDocx } from "./document.ts";
+import { generateXlsx } from "./spreadsheet.ts";
+import { generatePptx } from "./presentation.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -231,10 +233,22 @@ async function callClaude(
       env: cleanEnv,
     });
 
-    const output = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
+    // 2-minute timeout to prevent hanging
+    const TIMEOUT_MS = 120_000;
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => {
+        proc.kill();
+        reject(new Error("Claude CLI timed out after 2 minutes"));
+      }, TIMEOUT_MS)
+    );
 
-    const exitCode = await proc.exited;
+    const result = Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    const [output, stderr, exitCode] = await Promise.race([result, timeout]);
 
     if (exitCode !== 0) {
       console.error(`Claude exit code: ${exitCode}`);
@@ -243,8 +257,11 @@ async function callClaude(
     }
 
     return output.trim();
-  } catch (error) {
-    console.error("Spawn error:", error);
+  } catch (error: any) {
+    console.error("Spawn error:", error?.message || error);
+    if (error?.message?.includes("timed out")) {
+      return "Sorry, the request took too long. Please try again with a simpler message.";
+    }
     return `Error: Could not run Claude CLI`;
   }
 }
@@ -438,6 +455,90 @@ async function processDocumentActions(
   return clean;
 }
 
+/**
+ * Process [SEND_SPREADSHEET: filename.xlsx | content...] tags in Claude's response.
+ * Generates a .xlsx file and sends it via Telegram, then strips the tag from the response.
+ */
+async function processSpreadsheetActions(
+  ctx: Context,
+  response: string
+): Promise<string> {
+  let clean = response;
+
+  // [SEND_SPREADSHEET: filename.xlsx | sheet/table content...]
+  // Content can span multiple lines, so use [\s\S]+? (non-greedy)
+  const xlsxRegex = /\[SEND_SPREADSHEET:\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi;
+
+  for (const match of response.matchAll(xlsxRegex)) {
+    const rawFilename = match[1].trim();
+    const content = match[2].trim();
+
+    // Ensure .xlsx extension
+    const filename = rawFilename.endsWith(".xlsx") ? rawFilename : `${rawFilename}.xlsx`;
+
+    try {
+      console.log(`Generating spreadsheet: ${filename}`);
+      await ctx.replyWithChatAction("upload_document");
+
+      const xlsxBuffer = await generateXlsx(content);
+      await ctx.replyWithDocument(new InputFile(xlsxBuffer, filename));
+
+      console.log(`Sent spreadsheet: ${filename} (${xlsxBuffer.length} bytes)`);
+      clean = clean.replace(match[0], "");
+    } catch (error: any) {
+      console.error("Spreadsheet generation error:", error.message);
+      clean = clean.replace(
+        match[0],
+        `(Could not generate spreadsheet: ${error.message})`
+      );
+    }
+  }
+
+  return clean;
+}
+
+/**
+ * Process [SEND_PRESENTATION: filename.pptx | content...] tags in Claude's response.
+ * Generates a .pptx file and sends it via Telegram, then strips the tag from the response.
+ */
+async function processPresentationActions(
+  ctx: Context,
+  response: string
+): Promise<string> {
+  let clean = response;
+
+  // [SEND_PRESENTATION: filename.pptx | slide content...]
+  // Content can span multiple lines, so use [\s\S]+? (non-greedy)
+  const pptxRegex = /\[SEND_PRESENTATION:\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi;
+
+  for (const match of response.matchAll(pptxRegex)) {
+    const rawFilename = match[1].trim();
+    const content = match[2].trim();
+
+    // Ensure .pptx extension
+    const filename = rawFilename.endsWith(".pptx") ? rawFilename : `${rawFilename}.pptx`;
+
+    try {
+      console.log(`Generating presentation: ${filename}`);
+      await ctx.replyWithChatAction("upload_document");
+
+      const pptxBuffer = await generatePptx(content);
+      await ctx.replyWithDocument(new InputFile(pptxBuffer, filename));
+
+      console.log(`Sent presentation: ${filename} (${pptxBuffer.length} bytes)`);
+      clean = clean.replace(match[0], "");
+    } catch (error: any) {
+      console.error("Presentation generation error:", error.message);
+      clean = clean.replace(
+        match[0],
+        `(Could not generate presentation: ${error.message})`
+      );
+    }
+  }
+
+  return clean;
+}
+
 // ============================================================
 // MESSAGE HANDLERS
 // ============================================================
@@ -476,8 +577,14 @@ bot.on("message:text", async (ctx) => {
   // Process document generation tags — sends files via Telegram
   const afterDocs = await processDocumentActions(ctx, afterActions);
 
+  // Process spreadsheet generation tags — sends .xlsx files via Telegram
+  const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
+
+  // Process presentation generation tags — sends .pptx files via Telegram
+  const afterSlides = await processPresentationActions(ctx, afterSheets);
+
   // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, afterDocs);
+  const response = await processMemoryIntents(supabase, afterSlides);
 
   await saveMessage("assistant", response);
   await sendResponse(ctx, response);
@@ -536,7 +643,9 @@ bot.on("message:voice", async (ctx) => {
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
     const afterActions = await processMs365Actions(rawResponse);
     const afterDocs = await processDocumentActions(ctx, afterActions);
-    const claudeResponse = await processMemoryIntents(supabase, afterDocs);
+    const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
+    const afterSlides = await processPresentationActions(ctx, afterSheets);
+    const claudeResponse = await processMemoryIntents(supabase, afterSlides);
 
     await saveMessage("assistant", claudeResponse);
 
@@ -588,7 +697,9 @@ bot.on("message:photo", async (ctx) => {
     await unlink(filePath).catch(() => {});
 
     const afterDocs = await processDocumentActions(ctx, claudeResponse);
-    const cleanResponse = await processMemoryIntents(supabase, afterDocs);
+    const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
+    const afterSlides = await processPresentationActions(ctx, afterSheets);
+    const cleanResponse = await processMemoryIntents(supabase, afterSlides);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -625,7 +736,9 @@ bot.on("message:document", async (ctx) => {
     await unlink(filePath).catch(() => {});
 
     const afterDocs = await processDocumentActions(ctx, claudeResponse);
-    const cleanResponse = await processMemoryIntents(supabase, afterDocs);
+    const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
+    const afterSlides = await processPresentationActions(ctx, afterSheets);
+    const cleanResponse = await processMemoryIntents(supabase, afterSlides);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -710,6 +823,57 @@ function buildPrompt(
       "\nThe document is generated and sent as a .docx file attachment in Telegram automatically." +
       "\nWrite the full document content inside the tag — do NOT say you can't create files." +
       "\nExample: [SEND_DOCUMENT: proposal.docx | Business Proposal | # Introduction\\n\\nThis proposal outlines...\\n\\n## Key Points\\n\\n- Point one\\n- Point two]"
+  );
+
+  parts.push(
+    "\nSPREADSHEET GENERATION:" +
+      "\nYou CAN generate and send Excel spreadsheets (.xlsx) directly in Telegram!" +
+      "\nWhen the user asks you to create a spreadsheet, Excel file, or tabular data, include this tag:" +
+      "\n[SEND_SPREADSHEET: filename.xlsx |" +
+      "\n## Sheet: SheetName" +
+      "\n| Header1 | Header2 | Header3 |" +
+      "\n| value1 | value2 | =A2+B2 |" +
+      "\n---" +
+      "\n## Sheet: AnotherSheet" +
+      "\n| Col A | Col B |" +
+      "\n| data | data |" +
+      "\n]" +
+      "\nFormat rules:" +
+      "\n- Use ## Sheet: Name to start each sheet (separate multiple sheets with ---)" +
+      "\n- Use standard markdown pipe tables for rows and columns" +
+      "\n- First row of each table becomes the bold header row" +
+      "\n- Cells starting with = are treated as Excel formulas (e.g., =SUM(A2:A10), =B2*C2)" +
+      "\n- Cross-sheet references work (e.g., =Inputs!B2)" +
+      "\n- Numeric values are auto-detected and stored as numbers" +
+      "\n- You can create multiple sheets in one file" +
+      "\n- Write the full spreadsheet content inside the tag — do NOT say you cannot create Excel files."
+  );
+
+  parts.push(
+    "\nPRESENTATION GENERATION:" +
+      "\nYou CAN generate and send PowerPoint presentations (.pptx) directly in Telegram!" +
+      "\nWhen the user asks you to create a presentation, slides, or PowerPoint, include this tag:" +
+      "\n[SEND_PRESENTATION: filename.pptx |" +
+      "\n## Slide: Title Slide" +
+      "\n# Main Title" +
+      "\n## Subtitle" +
+      "\n" +
+      "\n## Slide: Key Points" +
+      "\n- Bullet point one" +
+      "\n- Bullet point two" +
+      "\n" +
+      "\n## Slide: Data Table" +
+      "\n| Header1 | Header2 | Header3 |" +
+      "\n| val1 | val2 | val3 |" +
+      "\n]" +
+      "\nFormat rules:" +
+      "\n- Use ## Slide: Title to start each slide" +
+      "\n- # Title for large headings, ## Subtitle for subtitles" +
+      "\n- Use - for bullet points, 1. for numbered lists" +
+      "\n- Use pipe tables for data tables on slides" +
+      "\n- Plain text becomes body text" +
+      "\n- Each slide gets a styled title bar automatically" +
+      "\n- Write the full presentation content inside the tag — do NOT say you cannot create PowerPoint files."
   );
 
   parts.push(
