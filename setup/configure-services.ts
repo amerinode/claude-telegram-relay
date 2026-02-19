@@ -46,6 +46,11 @@ const SERVICES: Record<string, ServiceDef> = {
     script: "src/relay.ts",
     description: "Main bot (always running)",
   },
+  "call-server": {
+    name: "claude-call-server",
+    script: "src/call-server.ts",
+    description: "Voice call WebSocket server (always running)",
+  },
   checkin: {
     name: "claude-smart-checkin",
     script: "examples/smart-checkin.ts",

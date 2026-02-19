@@ -22,7 +22,8 @@
     "exceljs": "^4.4.0",
     "grammy": "^1.21.1",
     "groq-sdk": "^0.37.0",
-    "pptxgenjs": "^4.0.1"
+    "pptxgenjs": "^4.0.1",
+    "twilio": "^5.12.2"
   },
   "devDependencies": {
     "@types/bun": "latest"

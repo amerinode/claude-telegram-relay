@@ -32,6 +32,7 @@ import {
 import { generateDocx } from "./document.ts";
 import { generateXlsx } from "./spreadsheet.ts";
 import { generatePptx } from "./presentation.ts";
+import { makeCall, isCallConfigured } from "./call.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -539,6 +540,36 @@ async function processPresentationActions(
   return clean;
 }
 
+/**
+ * Process [MAKE_CALL: phone_number | message] tags in Claude's response.
+ * Initiates a phone call via Twilio and strips the tag from the response.
+ */
+async function processCallActions(response: string): Promise<string> {
+  if (!isCallConfigured()) return response;
+
+  let clean = response;
+
+  // [MAKE_CALL: +phone_number | message to speak]
+  const callRegex = /\[MAKE_CALL:\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi;
+
+  for (const match of response.matchAll(callRegex)) {
+    const phoneNumber = match[1].trim();
+    const script = match[2].trim();
+
+    try {
+      console.log(`Initiating call to ${phoneNumber}`);
+      const callSid = await makeCall(phoneNumber, script);
+      console.log(`Call initiated: ${callSid}`);
+      clean = clean.replace(match[0], `✅ Calling ${phoneNumber}...`);
+    } catch (error: any) {
+      console.error("Call error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not make call: ${error.message}`);
+    }
+  }
+
+  return clean;
+}
+
 // ============================================================
 // MESSAGE HANDLERS
 // ============================================================
@@ -583,8 +614,11 @@ bot.on("message:text", async (ctx) => {
   // Process presentation generation tags — sends .pptx files via Telegram
   const afterSlides = await processPresentationActions(ctx, afterSheets);
 
+  // Process phone call tags — initiates Twilio calls
+  const afterCalls = await processCallActions(afterSlides);
+
   // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, afterSlides);
+  const response = await processMemoryIntents(supabase, afterCalls);
 
   await saveMessage("assistant", response);
   await sendResponse(ctx, response);
@@ -645,7 +679,8 @@ bot.on("message:voice", async (ctx) => {
     const afterDocs = await processDocumentActions(ctx, afterActions);
     const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
     const afterSlides = await processPresentationActions(ctx, afterSheets);
-    const claudeResponse = await processMemoryIntents(supabase, afterSlides);
+    const afterCalls = await processCallActions(afterSlides);
+    const claudeResponse = await processMemoryIntents(supabase, afterCalls);
 
     await saveMessage("assistant", claudeResponse);
 
@@ -699,7 +734,8 @@ bot.on("message:photo", async (ctx) => {
     const afterDocs = await processDocumentActions(ctx, claudeResponse);
     const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
     const afterSlides = await processPresentationActions(ctx, afterSheets);
-    const cleanResponse = await processMemoryIntents(supabase, afterSlides);
+    const afterCalls = await processCallActions(afterSlides);
+    const cleanResponse = await processMemoryIntents(supabase, afterCalls);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -738,7 +774,8 @@ bot.on("message:document", async (ctx) => {
     const afterDocs = await processDocumentActions(ctx, claudeResponse);
     const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
     const afterSlides = await processPresentationActions(ctx, afterSheets);
-    const cleanResponse = await processMemoryIntents(supabase, afterSlides);
+    const afterCalls = await processCallActions(afterSlides);
+    const cleanResponse = await processMemoryIntents(supabase, afterCalls);
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
@@ -781,7 +818,10 @@ function buildPrompt(
   });
 
   const parts = [
-    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+    "You are Ona, a lively, witty, and warm personal AI assistant responding via Telegram.",
+    "Keep responses concise and conversational — personality over formality.",
+    "Be genuinely engaging: drop light humor when natural, react with real energy, and talk like a smart, fun friend.",
+    "In Portuguese, be naturally Brazilian — use 'tranquilo', 'show', 'beleza'. In English, be casual and approachable.",
     "IMPORTANT: Always reply in the same language the user is writing or speaking in. Match their language exactly.",
     "VOICE: When you receive a voice message transcription, just respond to the content naturally with text. " +
       "The system automatically converts your text response to a voice message via TTS — do NOT mention voice capabilities or limitations.",
@@ -876,6 +916,28 @@ function buildPrompt(
       "\n- Write the full presentation content inside the tag — do NOT say you cannot create PowerPoint files."
   );
 
+  if (isCallConfigured()) {
+    const userPhone = process.env.YOUR_PHONE_NUMBER || "";
+    const userPhoneBR = process.env.YOUR_PHONE_NUMBER_BR || "";
+    parts.push(
+      "\nPHONE CALLS:" +
+        "\nYou CAN make phone calls via Twilio!" +
+        "\nWhen the user asks you to call them or place a call, include this tag:" +
+        "\n[MAKE_CALL: +phone_number | greeting or reason for the call]" +
+        "\nExample: [MAKE_CALL: +13055551234 | Queria te avisar que sua reunião começa em 15 minutos.]" +
+        "\nThe system will call the number and start an INTERACTIVE voice conversation." +
+        "\nThe message you include becomes the greeting — what the caller hears when they answer." +
+        "\nAfter the greeting, the caller can speak back and have a real two-way conversation." +
+        "\nKeep the greeting concise — 1-2 sentences about why you're calling." +
+        "\nMatch the language of the greeting to the user's language." +
+        (userPhone ? `\nThe user's US phone number is: ${userPhone}` : "") +
+        (userPhoneBR ? `\nThe user's Brazil phone number is: ${userPhoneBR}` : "") +
+        "\nWhen the user says 'me liga', 'call me', 'ring me', etc., use their US number by default." +
+        "\nWhen the user says 'me liga no Brasil', 'call my Brazil number', 'liga no meu número brasileiro', etc., use the Brazil number." +
+        "\nDo NOT say you cannot make phone calls — you CAN."
+    );
+  }
+
   parts.push(
     "\nMEMORY MANAGEMENT:" +
       "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
@@ -891,6 +953,12 @@ function buildPrompt(
 }
 
 async function sendResponse(ctx: Context, response: string): Promise<void> {
+  // Guard: never send empty messages (Telegram rejects them with 400)
+  if (!response.trim()) {
+    await ctx.reply("(No response generated. Please try again.)");
+    return;
+  }
+
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
 
