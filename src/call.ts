@@ -22,12 +22,13 @@ const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_PHONE_NUMBER || "";
 
-// ElevenLabs FEMALE voices for ConversationRelay (Ona is a woman!)
-// Warm, natural, conversational voices — no API key needed (Twilio built-in)
+// ElevenLabs FEMALE premade voices for ConversationRelay
+// Premade voices are official ElevenLabs voices available on all tiers including Twilio
+// Community voices (Amora Faria etc.) only work via direct API (Telegram), not via Twilio
 const ELEVENLABS_VOICES: Record<string, string> = {
-  pt: "QJd9SLe6MVCdF6DR0EAu",  // Amora Faria (soft, sweet, warm Brazilian female)
-  en: "MnUw1cSnpiLoLhpd3Hqp",  // English female voice (selected by Gil)
-  es: "86V9x9hrQds83qf7zaGn",  // Spanish female voice (selected by Gil)
+  pt: "EXAVITQu4vr4xnSDxMaL",  // Sarah (soft, warm, natural female — premade, Gil's pick)
+  en: "21m00Tcm4TlvDq8ikWAM",  // Rachel (young, calm American female — premade)
+  es: "EXAVITQu4vr4xnSDxMaL",  // Sarah (soft, warm, natural female — premade, Gil's pick)
 };
 
 // Amazon Polly Neural voices for <Say> fallback (per language)
@@ -37,11 +38,15 @@ const POLLY_FALLBACK: Record<string, string> = {
   es: "Polly.Mia-Neural",
 };
 
-// Language codes for TwiML
+// Language codes for TwiML (must be supported by Twilio ConversationRelay + ElevenLabs)
+// Supported: bg-BG, cs-CZ, da-DK, de-DE, en-AU, en-GB, en-IN, en-US, es-ES, es-US,
+//            fi-FI, fr-CA, fr-FR, hi-IN, hu-HU, id-ID, it-IT, ja-JP, ko-KR, nl-BE,
+//            nl-NL, pl-PL, pt-BR, pt-PT, ro-RO, ru-RU, sv-SE, ta-IN, tr-TR, uk-UA, vi-VN
+// NOTE: es-MX is NOT supported — use es-US instead
 const LANG_CODES: Record<string, string> = {
   pt: "pt-BR",
   en: "en-US",
-  es: "es-MX",
+  es: "es-US",
 };
 
 // ============================================================
@@ -151,24 +156,19 @@ export async function makeCall(
 // ============================================================
 
 /**
- * Build a natural welcome greeting from the call reason/message.
- * This is what the caller hears when they answer the phone.
+ * Build a brief welcome greeting.
+ * Keep it short — just a quick "hi" so the person knows someone's there.
+ * The real conversation starts after they respond.
  */
-function buildGreeting(message: string, lang: string): string {
+function buildGreeting(_message: string, lang: string): string {
   const userName = process.env.USER_NAME || "";
 
   if (lang === "pt") {
-    return userName
-      ? `Oi ${userName}, aqui é a Ona. ${message}`
-      : `Oi, aqui é a Ona. ${message}`;
+    return userName ? `Oi ${userName}!` : `Oi!`;
   } else if (lang === "es") {
-    return userName
-      ? `Hola ${userName}, soy Ona. ${message}`
-      : `Hola, soy Ona. ${message}`;
+    return userName ? `Hola ${userName}!` : `Hola!`;
   } else {
-    return userName
-      ? `Hi ${userName}, this is Ona. ${message}`
-      : `Hi, this is Ona. ${message}`;
+    return userName ? `Hi ${userName}!` : `Hi!`;
   }
 }
 

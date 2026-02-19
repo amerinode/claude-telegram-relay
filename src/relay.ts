@@ -216,10 +216,26 @@ async function callClaude(
     allowedTools.push("mcp__perplexity__perplexity_search", "mcp__perplexity__perplexity_ask", "mcp__perplexity__perplexity_research", "mcp__perplexity__perplexity_reason");
   }
 
+  // File access tools — allows Ona to read/write files in allowed directories
+  if (process.env.ALLOWED_DIRS) {
+    allowedTools.push("Read", "Write", "Edit", "Glob", "Grep");
+  }
+
   claudeArgs.push("--allowedTools", ...allowedTools);
+
+  // Add extra directories Ona can access (comma-separated)
+  if (process.env.ALLOWED_DIRS) {
+    const dirs = process.env.ALLOWED_DIRS.split(",").map(d => d.trim()).filter(Boolean);
+    for (const dir of dirs) {
+      claudeArgs.push("--add-dir", dir);
+    }
+  }
 
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
   console.log(`Allowed tools: ${allowedTools.join(", ")}`);
+  if (process.env.ALLOWED_DIRS) {
+    console.log(`File access dirs: ${process.env.ALLOWED_DIRS}`);
+  }
 
   try {
     // Strip Claude Code env vars to avoid nesting detection
@@ -321,7 +337,10 @@ function needsMs365(message: string): boolean {
     /\b(my (tasks?|to-?dos?|to do list))\b/i,
     /\b(tarefas?|lista de tarefas?|pendências|afazeres)\b/i,
     /\b(add|create|adicionar|criar|nova)\b.{0,20}\b(task|to-?do|tarefa)\b/i,
-    /\b(complete|done|finish|conclu[ií]|feito|pronto)\b.{0,20}\b(task|to-?do|tarefa)\b/i,
+    /\b(complete[d]?|done|finish|conclu[ií]\w*|feit[oa]|pronto)\b.{0,20}\b(task|to-?do|tarefa)\b/i,
+    // "completed X" or "concluida X" without needing the word "task" — intent is clear from context
+    /^(completed?|done|finished|conclu[ií]\w*|feit[oa]|pronto)\b.{1,60}$/i,
+    /^(tarefa|task)\b.{0,10}\b(feita|done|completed|conclu[ií]\w*|pronta)\b/i,
     /\bwhat do i (need|have) to do\b/i,
     /\b(o que|que).{0,10}(preciso|tenho que) fazer\b/i,
   ];
@@ -428,8 +447,8 @@ async function processMs365Actions(response: string): Promise<string> {
   }
 
   // [CREATE_TASK: list name | title | optional due date YYYY-MM-DD]
-  // Also supports old format: [CREATE_TASK: title | due date] (no list name)
-  for (const match of response.matchAll(/\[CREATE_TASK:\s*(.+?)\s*(?:\|\s*(.+?)\s*)?(?:\|\s*(.+?)\s*)?\]/gi)) {
+  // Also accepts [ADD_TASK:] as alias
+  for (const match of response.matchAll(/\[(?:CREATE_TASK|ADD_TASK):\s*(.+?)\s*(?:\|\s*(.+?)\s*)?(?:\|\s*(.+?)\s*)?\]/gi)) {
     try {
       let listNameParam: string | undefined;
       let title: string;
@@ -468,15 +487,19 @@ async function processMs365Actions(response: string): Promise<string> {
     }
   }
 
-  // [COMPLETE_TASK: search text]
-  for (const match of response.matchAll(/\[COMPLETE_TASK:\s*(.+?)\]/gi)) {
+  // [COMPLETE_TASK: search text] or [COMPLETE_TASK: search text | list name]
+  // Also accepts [DONE_TASK:] and [FINISH_TASK:]
+  for (const match of response.matchAll(/\[(?:COMPLETE_TASK|DONE_TASK|FINISH_TASK):\s*(.+?)\]/gi)) {
     try {
-      const result = await completeTask(match[1].trim());
+      // Claude sometimes sends "title | list" — extract just the title for search
+      const rawSearch = match[1].trim();
+      const searchText = rawSearch.includes("|") ? rawSearch.split("|")[0].trim() : rawSearch;
+      const result = await completeTask(searchText);
       if (result) {
         console.log(`Completed task: ${result.title}`);
         clean = clean.replace(match[0], `✅ Done: "${result.title}"`);
       } else {
-        clean = clean.replace(match[0], `❌ Could not find task matching "${match[1].trim()}"`);
+        clean = clean.replace(match[0], `❌ Could not find task matching "${searchText}"`);
       }
     } catch (error: any) {
       console.error("Complete task error:", error.message);
@@ -490,6 +513,29 @@ async function processMs365Actions(response: string): Promise<string> {
 // ============================================================
 // DOCUMENT GENERATION & SENDING
 // ============================================================
+
+/**
+ * Save a generated file to Ona's folder (if ALLOWED_DIRS is configured).
+ * Checks if the user's message mentions saving to "your folder" / "sua pasta".
+ */
+async function saveToOnaFolder(filename: string, buffer: Buffer): Promise<string | null> {
+  const allowedDirs = process.env.ALLOWED_DIRS;
+  if (!allowedDirs) return null;
+
+  const onaDir = allowedDirs.split(",")[0].trim();
+  if (!onaDir) return null;
+
+  try {
+    await mkdir(onaDir, { recursive: true });
+    const filePath = join(onaDir, filename);
+    await writeFile(filePath, buffer);
+    console.log(`Saved to Ona's folder: ${filePath} (${buffer.length} bytes)`);
+    return filePath;
+  } catch (error: any) {
+    console.error(`Failed to save to Ona's folder: ${error.message}`);
+    return null;
+  }
+}
 
 /**
  * Process [SEND_DOCUMENT: filename | title | content...] tags in Claude's response.
@@ -519,6 +565,7 @@ async function processDocumentActions(
 
       const docBuffer = await generateDocx(content, title);
       await ctx.replyWithDocument(new InputFile(docBuffer, filename));
+      await saveToOnaFolder(filename, docBuffer);
 
       console.log(`Sent document: ${filename} (${docBuffer.length} bytes)`);
       clean = clean.replace(match[0], "");
@@ -561,6 +608,7 @@ async function processSpreadsheetActions(
 
       const xlsxBuffer = await generateXlsx(content);
       await ctx.replyWithDocument(new InputFile(xlsxBuffer, filename));
+      await saveToOnaFolder(filename, xlsxBuffer);
 
       console.log(`Sent spreadsheet: ${filename} (${xlsxBuffer.length} bytes)`);
       clean = clean.replace(match[0], "");
@@ -603,6 +651,7 @@ async function processPresentationActions(
 
       const pptxBuffer = await generatePptx(content);
       await ctx.replyWithDocument(new InputFile(pptxBuffer, filename));
+      await saveToOnaFolder(filename, pptxBuffer);
 
       console.log(`Sent presentation: ${filename} (${pptxBuffer.length} bytes)`);
       clean = clean.replace(match[0], "");
@@ -619,24 +668,29 @@ async function processPresentationActions(
 }
 
 /**
- * Process [MAKE_CALL: phone_number | message] tags in Claude's response.
+ * Process [MAKE_CALL: phone_number | reason | lang] tags in Claude's response.
  * Initiates a phone call via Twilio and strips the tag from the response.
+ * Lang is optional — if omitted, detected from the reason text.
  */
 async function processCallActions(response: string): Promise<string> {
   if (!isCallConfigured()) return response;
 
   let clean = response;
 
-  // [MAKE_CALL: +phone_number | message to speak]
+  // [MAKE_CALL: +phone_number | reason | lang] — lang is optional
   const callRegex = /\[MAKE_CALL:\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi;
 
   for (const match of response.matchAll(callRegex)) {
-    const phoneNumber = match[1].trim();
-    const script = match[2].trim();
+    const rawArgs = match.slice(1).map(s => s.trim());
+    const phoneNumber = rawArgs[0];
+    // Split the second capture on | to get reason and optional lang
+    const parts = rawArgs[1].split("|").map(s => s.trim());
+    const reason = parts[0];
+    const lang = parts[1] || undefined; // "pt", "en", "es" or undefined
 
     try {
-      console.log(`Initiating call to ${phoneNumber}`);
-      const callSid = await makeCall(phoneNumber, script);
+      console.log(`Initiating call to ${phoneNumber} (reason: ${reason}, lang: ${lang || "auto"})`);
+      const callSid = await makeCall(phoneNumber, reason, lang);
       console.log(`Call initiated: ${callSid}`);
       clean = clean.replace(match[0], `✅ Calling ${phoneNumber}...`);
     } catch (error: any) {
@@ -1002,18 +1056,35 @@ function buildPrompt(
       "\nPHONE CALLS:" +
         "\nYou CAN make phone calls via Twilio!" +
         "\nWhen the user asks you to call them or place a call, include this tag:" +
-        "\n[MAKE_CALL: +phone_number | greeting or reason for the call]" +
-        "\nExample: [MAKE_CALL: +13055551234 | Queria te avisar que sua reunião começa em 15 minutos.]" +
+        "\n[MAKE_CALL: +phone_number | reason for calling | lang]" +
+        "\nThe lang parameter is REQUIRED: pt, en, or es. Use the language the user is speaking." +
+        "\nExample: [MAKE_CALL: +13055551234 | reunião em 15 minutos | pt]" +
+        "\nExample: [MAKE_CALL: +13055551234 | quick check-in | en]" +
         "\nThe system will call the number and start an INTERACTIVE voice conversation." +
-        "\nThe message you include becomes the greeting — what the caller hears when they answer." +
-        "\nAfter the greeting, the caller can speak back and have a real two-way conversation." +
-        "\nKeep the greeting concise — 1-2 sentences about why you're calling." +
-        "\nMatch the language of the greeting to the user's language." +
+        "\nThe reason is internal context ONLY — it is NOT spoken to the caller." +
+        "\nThe system says a brief 'Oi!' / 'Hi!' automatically. Do NOT include greetings or introductions in the reason." +
+        "\nJust provide the topic/reason in a few words. No 'Oi', no 'aqui é a Ona', no full sentences." +
+        "\nAfter the caller answers, they can speak back and have a real two-way conversation." +
         (userPhone ? `\nThe user's US phone number is: ${userPhone}` : "") +
         (userPhoneBR ? `\nThe user's Brazil phone number is: ${userPhoneBR}` : "") +
         "\nWhen the user says 'me liga', 'call me', 'ring me', etc., use their US number by default." +
         "\nWhen the user says 'me liga no Brasil', 'call my Brazil number', 'liga no meu número brasileiro', etc., use the Brazil number." +
         "\nDo NOT say you cannot make phone calls — you CAN."
+    );
+  }
+
+  // File access instructions (only when ALLOWED_DIRS is configured)
+  if (process.env.ALLOWED_DIRS) {
+    const dirs = process.env.ALLOWED_DIRS.split(",").map(d => d.trim()).filter(Boolean);
+    parts.push(
+      "\nFILE ACCESS:" +
+        "\nYou have Read, Write, Edit, Glob, and Grep tools available." +
+        "\nYou can read, create, edit, and search files in these directories:" +
+        dirs.map(d => `\n  - ${d}`).join("") +
+        "\nWhen the user says 'save to your folder', 'sua pasta', 'your directory', 'your folder' — use the first directory listed above." +
+        "\nGenerated documents (.docx, .xlsx, .pptx) are AUTOMATICALLY saved to your folder — just use the normal [SEND_DOCUMENT:] or [SEND_SPREADSHEET:] tags." +
+        "\nFor plain text files, notes, or non-document content, use the Write tool to save directly to your folder." +
+        "\nIMPORTANT: When using Write, use FULL ABSOLUTE paths (e.g., " + dirs[0] + "/filename.txt). Do NOT use relative paths."
     );
   }
 

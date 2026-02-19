@@ -562,8 +562,28 @@ export async function createTask(params: {
  */
 export async function completeTask(searchText: string): Promise<{ title: string; listName: string } | null> {
   const tasks = await listTasks();
-  const search = searchText.toLowerCase();
-  const task = tasks.find(t => t.title.toLowerCase().includes(search));
+  const search = searchText.toLowerCase().trim();
+
+  // 1. Exact substring match
+  let task = tasks.find(t => t.title.toLowerCase().includes(search));
+
+  // 2. Try each word (for multi-word searches like "Call Junior" matching "ligar para o Junior")
+  if (!task) {
+    const words = search.split(/\s+/).filter(w => w.length > 2);
+    task = tasks.find(t => {
+      const title = t.title.toLowerCase();
+      return words.every(w => title.includes(w));
+    });
+  }
+
+  // 3. Try matching any significant word (at least 4 chars)
+  if (!task) {
+    const words = search.split(/\s+/).filter(w => w.length >= 4);
+    task = tasks.find(t => {
+      const title = t.title.toLowerCase();
+      return words.some(w => title.includes(w));
+    });
+  }
 
   if (!task) return null;
 
@@ -673,15 +693,19 @@ export async function handleMs365Request(userMessage: string, recentHistory: str
         const taskLists = await listTaskLists();
         const listNames = taskLists.map(l => l.displayName).join(", ");
         context += `\nAVAILABLE TASK LISTS: ${listNames}`;
-        context += "\n\nACTION AVAILABLE: You can create To Do tasks. Include this tag: [CREATE_TASK: list name | task title | optional due date (YYYY-MM-DD)]. The list name MUST match one of the available lists above. If the user specifies a list name, use the closest match. If no list is mentioned, use 'Tasks'.";
+        context += "\n\nACTION AVAILABLE: You can create To Do tasks. Include EXACTLY this tag (not ADD_TASK, not NEW_TASK — use CREATE_TASK): [CREATE_TASK: list name | task title | optional due date (YYYY-MM-DD)]. The list name MUST match one of the available lists above. If the user specifies a list name, use the closest match. If no list is mentioned, use 'Tasks'.";
       } catch {
-        context += "\n\nACTION AVAILABLE: You can create To Do tasks. Include this tag: [CREATE_TASK: list name | task title | optional due date (YYYY-MM-DD)]";
+        context += "\n\nACTION AVAILABLE: You can create To Do tasks. Include EXACTLY this tag: [CREATE_TASK: list name | task title | optional due date (YYYY-MM-DD)]";
       }
     }
 
-    // Complete task action
-    if (msg.match(/\b(complete|done|finish|mark.{0,10}done|conclu[ií]|feito|pronto|terminar|finalizar)\b/i) && msg.match(/\b(task|to-?do|tarefa)\b/i)) {
-      context += "\n\nACTION AVAILABLE: You can mark tasks as completed. Include this tag: [COMPLETE_TASK: search text matching the task title]";
+    // Complete task action — with or without the word "task"
+    // "completed book botox" or "concluida ligar pro Junior" should trigger too
+    const hasCompletionWord = msg.match(/\b(complete[d]?|done|finish|mark.{0,10}done|conclu[ií]\w*|feit[oa]|pronto|termina[dr]|finaliza[dr])\b/i);
+    const hasTaskWord = msg.match(/\b(task|to-?do|tarefa)\b/i);
+    const isCompletionIntent = msg.match(/^(completed?|done|finished|conclu[ií]\w*|feit[oa]|pronto)\b.{1,60}$/i);
+    if ((hasCompletionWord && hasTaskWord) || isCompletionIntent) {
+      context += "\n\nACTION AVAILABLE: You can mark tasks as completed. Include EXACTLY this tag: [COMPLETE_TASK: task title text]. Just the task title — no list name, no pipe symbol.";
     }
 
     return context || "No relevant MS365 data found for this request.";
