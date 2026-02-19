@@ -1057,9 +1057,11 @@ function buildPrompt(
         "\nYou CAN make phone calls via Twilio!" +
         "\nWhen the user asks you to call them or place a call, include this tag:" +
         "\n[MAKE_CALL: +phone_number | reason for calling | lang]" +
-        "\nThe lang parameter is REQUIRED: pt, en, or es. Use the language the user is speaking." +
-        "\nExample: [MAKE_CALL: +13055551234 | reunião em 15 minutos | pt]" +
-        "\nExample: [MAKE_CALL: +13055551234 | quick check-in | en]" +
+        "\nThe lang parameter is REQUIRED: pt, en, or es." +
+        "\nIMPORTANT: lang = the language of the user's MESSAGE, NOT the country being called." +
+        "\n'Call me in Brazil' is English → lang: en. 'Me liga no Brasil' is Portuguese → lang: pt." +
+        "\nExample: [MAKE_CALL: +5511999999999 | check-in | en]" +
+        "\nExample: [MAKE_CALL: +5511999999999 | reunião em 15 minutos | pt]" +
         "\nThe system will call the number and start an INTERACTIVE voice conversation." +
         "\nThe reason is internal context ONLY — it is NOT spoken to the caller." +
         "\nThe system says a brief 'Oi!' / 'Hi!' automatically. Do NOT include greetings or introductions in the reason." +
