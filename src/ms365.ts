@@ -44,7 +44,7 @@ async function refreshAccessToken(): Promise<string> {
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
-    scope: "Mail.ReadWrite Mail.Send Calendars.ReadWrite User.Read offline_access",
+    scope: "Mail.ReadWrite Mail.Send Calendars.ReadWrite Tasks.ReadWrite User.Read offline_access",
   });
 
   const resp = await fetch(TOKEN_URL, {
@@ -367,6 +367,231 @@ export async function createDraft(params: {
   return { id: result.id, subject: result.subject };
 }
 
+// ============================================================
+// MICROSOFT TO DO — Task Lists & Tasks
+// ============================================================
+
+export interface TaskList {
+  id: string;
+  displayName: string;
+  isOwner: boolean;
+}
+
+export interface TodoTask {
+  id: string;
+  title: string;
+  status: "notStarted" | "inProgress" | "completed";
+  importance: "low" | "normal" | "high";
+  dueDateTime?: string;
+  createdDateTime: string;
+  listId: string;
+  listName: string;
+  body?: string;
+}
+
+/**
+ * List all To Do task lists.
+ */
+export async function listTaskLists(): Promise<TaskList[]> {
+  const data = await graphRequest("/me/todo/lists", {
+    params: { $top: "50" },
+  }) as { value: any[] };
+
+  return (data.value || []).map((l: any) => ({
+    id: l.id,
+    displayName: l.displayName || "Untitled",
+    isOwner: l.isOwner ?? true,
+  }));
+}
+
+/**
+ * List tasks from a specific list, or from all lists if no listId given.
+ * By default returns only incomplete tasks. Set includeCompleted=true for all.
+ * Set excludeFlaggedEmails=true (default) to skip the auto-generated "Flagged Emails" list.
+ */
+export async function listTasks(options?: {
+  listId?: string;
+  includeCompleted?: boolean;
+  excludeFlaggedEmails?: boolean;
+  count?: number;
+}): Promise<TodoTask[]> {
+  const { listId, includeCompleted = false, excludeFlaggedEmails = true, count = 50 } = options || {};
+
+  // If a specific list is given, query just that one
+  if (listId) {
+    return fetchTasksFromList(listId, "", includeCompleted, count);
+  }
+
+  // Otherwise, get all lists and aggregate tasks
+  const lists = await listTaskLists();
+  const allTasks: TodoTask[] = [];
+
+  for (const list of lists) {
+    // Skip "Flagged Emails" by default — it's auto-generated and usually stale
+    if (excludeFlaggedEmails && list.displayName.toLowerCase().includes("flagged email")) {
+      continue;
+    }
+    const tasks = await fetchTasksFromList(list.id, list.displayName, includeCompleted, count);
+    allTasks.push(...tasks);
+  }
+
+  // Sort by due date (soonest first), then by importance
+  return allTasks.sort((a, b) => {
+    // High importance first
+    const impOrder = { high: 0, normal: 1, low: 2 };
+    const impDiff = (impOrder[a.importance] || 1) - (impOrder[b.importance] || 1);
+    if (impDiff !== 0) return impDiff;
+
+    // Then by due date
+    if (a.dueDateTime && b.dueDateTime) return new Date(a.dueDateTime).getTime() - new Date(b.dueDateTime).getTime();
+    if (a.dueDateTime) return -1;
+    if (b.dueDateTime) return 1;
+    return 0;
+  });
+}
+
+async function fetchTasksFromList(
+  listId: string,
+  listName: string,
+  includeCompleted: boolean,
+  count: number
+): Promise<TodoTask[]> {
+  const params: Record<string, string> = {
+    $top: String(count),
+  };
+
+  const data = await graphRequest(`/me/todo/lists/${listId}/tasks`, { params }) as { value: any[] };
+
+  let tasks = (data.value || []).map((t: any) => ({
+    id: t.id,
+    title: t.title || "(untitled)",
+    status: (t.status || "notStarted") as TodoTask["status"],
+    importance: (t.importance || "normal") as TodoTask["importance"],
+    dueDateTime: t.dueDateTime?.dateTime || undefined,
+    createdDateTime: t.createdDateTime || "",
+    listId,
+    listName: listName || "Tasks",
+    body: t.body?.content?.substring(0, 200) || undefined,
+  }));
+
+  // Filter completed tasks client-side (Graph To Do API doesn't support $filter on status)
+  if (!includeCompleted) {
+    tasks = tasks.filter(t => t.status !== "completed");
+  }
+
+  return tasks;
+}
+
+/**
+ * Create a new task in a To Do list.
+ * Matches listName by fuzzy search (case-insensitive, partial match).
+ * If no list is specified or found, creates in the default "Tasks" list.
+ */
+export async function createTask(params: {
+  title: string;
+  listId?: string;
+  listName?: string;
+  dueDateTime?: string;
+  importance?: "low" | "normal" | "high";
+  body?: string;
+}): Promise<{ id: string; title: string; listName: string }> {
+  const lists = await listTaskLists();
+  let targetListId = params.listId;
+  let listName = "Tasks";
+
+  if (!targetListId && params.listName) {
+    // Fuzzy match the list name (case-insensitive, partial match, strip emojis)
+    const search = params.listName.toLowerCase().trim();
+    const stripEmoji = (s: string) => s.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, "").trim().toLowerCase();
+
+    const matched =
+      // Exact match (case-insensitive)
+      lists.find(l => l.displayName.toLowerCase() === search)
+      // Display name contains search term
+      || lists.find(l => l.displayName.toLowerCase().includes(search))
+      // Search term contains display name
+      || lists.find(l => search.includes(l.displayName.toLowerCase()))
+      // Match with emojis stripped (e.g., "groceries" matches "🛒 Groceries")
+      || lists.find(l => stripEmoji(l.displayName) === search)
+      || lists.find(l => stripEmoji(l.displayName).includes(search))
+      || lists.find(l => search.includes(stripEmoji(l.displayName)))
+      // Fuzzy prefix: share at least 5 chars (e.g., "grocery" ↔ "groceries" share "grocer")
+      || lists.find(l => {
+        const stripped = stripEmoji(l.displayName);
+        const minLen = Math.min(stripped.length, search.length);
+        if (minLen < 4) return false;
+        const prefixLen = Math.max(4, minLen - 2);
+        return stripped.substring(0, prefixLen) === search.substring(0, prefixLen);
+      });
+
+    if (matched) {
+      targetListId = matched.id;
+      listName = matched.displayName;
+    }
+  }
+
+  if (!targetListId) {
+    // Fallback to default "Tasks" list
+    const defaultList = lists.find(l => l.displayName === "Tasks" || l.displayName === "Tarefas") || lists[0];
+    if (!defaultList) throw new Error("No task lists found");
+    targetListId = defaultList.id;
+    listName = defaultList.displayName;
+  }
+
+  const taskBody: any = { title: params.title };
+
+  if (params.dueDateTime) {
+    taskBody.dueDateTime = {
+      dateTime: params.dueDateTime,
+      timeZone: process.env.USER_TIMEZONE || "America/Sao_Paulo",
+    };
+  }
+  if (params.importance) taskBody.importance = params.importance;
+  if (params.body) taskBody.body = { content: params.body, contentType: "text" };
+
+  const result = await graphRequest(`/me/todo/lists/${targetListId}/tasks`, {
+    method: "POST",
+    body: taskBody,
+  }) as any;
+
+  return { id: result.id, title: result.title, listName };
+}
+
+/**
+ * Mark a task as completed (search by title text).
+ */
+export async function completeTask(searchText: string): Promise<{ title: string; listName: string } | null> {
+  const tasks = await listTasks();
+  const search = searchText.toLowerCase();
+  const task = tasks.find(t => t.title.toLowerCase().includes(search));
+
+  if (!task) return null;
+
+  await graphRequest(`/me/todo/lists/${task.listId}/tasks/${task.id}`, {
+    method: "PATCH",
+    body: { status: "completed" },
+  });
+
+  return { title: task.title, listName: task.listName };
+}
+
+/**
+ * Delete a task (search by title text).
+ */
+export async function deleteTask(searchText: string): Promise<{ title: string; listName: string } | null> {
+  const tasks = await listTasks({ includeCompleted: true });
+  const search = searchText.toLowerCase();
+  const task = tasks.find(t => t.title.toLowerCase().includes(search));
+
+  if (!task) return null;
+
+  await graphRequest(`/me/todo/lists/${task.listId}/tasks/${task.id}`, {
+    method: "DELETE",
+  });
+
+  return { title: task.title, listName: task.listName };
+}
+
 /**
  * Process a natural language MS365 request using Claude.
  * Claude gets the available functions and figures out which to call.
@@ -416,6 +641,47 @@ export async function handleMs365Request(userMessage: string, recentHistory: str
 
     if (msg.match(/\b(draft|save.{0,10}draft|add.{0,10}draft)\b/i)) {
       context += "\n\nACTION AVAILABLE: You can save emails to the Drafts folder. Include this tag: [CREATE_DRAFT: recipient@email.com | Subject line | Email body text]";
+    }
+
+    // To Do / Tasks
+    if (msg.match(/\b(tasks?|to-?dos?|tarefas?|lista de tarefas?|to do|pendências|pendente)\b/i)) {
+      try {
+        const tasks = await listTasks();
+        const taskLists = await listTaskLists();
+        const listNames = taskLists.map(l => l.displayName).join(", ");
+
+        if (tasks.length) {
+          context += "\nTO DO TASKS:\n" + tasks.map(t => {
+            const due = t.dueDateTime
+              ? ` (due: ${new Date(t.dueDateTime).toLocaleDateString("en-US", { month: "short", day: "numeric" })})`
+              : "";
+            const imp = t.importance === "high" ? " ⚠️HIGH" : "";
+            return `- [${t.listName}] ${t.title}${due}${imp}`;
+          }).join("\n");
+        } else {
+          context += "\nTO DO TASKS: No pending tasks.";
+        }
+        context += `\nAVAILABLE TASK LISTS: ${listNames}`;
+      } catch (error: any) {
+        console.error("To Do fetch error:", error.message);
+      }
+    }
+
+    // Create task action — detect "add to my X list" patterns too
+    if (msg.match(/\b(add|create|adicionar|criar|nova)\b/i) && msg.match(/\b(task|to-?do|tarefa|list)\b/i)) {
+      try {
+        const taskLists = await listTaskLists();
+        const listNames = taskLists.map(l => l.displayName).join(", ");
+        context += `\nAVAILABLE TASK LISTS: ${listNames}`;
+        context += "\n\nACTION AVAILABLE: You can create To Do tasks. Include this tag: [CREATE_TASK: list name | task title | optional due date (YYYY-MM-DD)]. The list name MUST match one of the available lists above. If the user specifies a list name, use the closest match. If no list is mentioned, use 'Tasks'.";
+      } catch {
+        context += "\n\nACTION AVAILABLE: You can create To Do tasks. Include this tag: [CREATE_TASK: list name | task title | optional due date (YYYY-MM-DD)]";
+      }
+    }
+
+    // Complete task action
+    if (msg.match(/\b(complete|done|finish|mark.{0,10}done|conclu[ií]|feito|pronto|terminar|finalizar)\b/i) && msg.match(/\b(task|to-?do|tarefa)\b/i)) {
+      context += "\n\nACTION AVAILABLE: You can mark tasks as completed. Include this tag: [COMPLETE_TASK: search text matching the task title]";
     }
 
     return context || "No relevant MS365 data found for this request.";

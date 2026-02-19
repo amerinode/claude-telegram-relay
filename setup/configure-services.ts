@@ -60,10 +60,90 @@ const SERVICES: Record<string, ServiceDef> = {
   briefing: {
     name: "claude-morning-briefing",
     script: "examples/morning-briefing.ts",
-    cron: "0 9 * * *",
-    description: "Morning briefing (daily at 9am)",
+    cron: "0 8 * * 1-5",
+    description: "Morning briefing (Mon-Fri at 8am)",
   },
 };
+
+/**
+ * Parse a cron expression and create a Windows Task Scheduler task.
+ * Supports: "0 8 * * 1-5" (daily Mon-Fri at 8am), "*/30 9-18 * * *" (every 30 min 9am-6pm)
+ */
+async function installWindowsScheduledTask(config: ServiceDef): Promise<boolean> {
+  if (!config.cron) return false;
+
+  const taskName = config.name;
+  const bunPath = (await run(["where", "bun"])).stdout.split("\n")[0]?.trim() || "bun";
+  const scriptPath = join(PROJECT_ROOT, config.script);
+
+  // Delete existing task (ignore errors if it doesn't exist)
+  await run(["schtasks", "/Delete", "/TN", taskName, "/F"]);
+
+  // Parse cron: minute hour dom month dow
+  const parts = config.cron.split(/\s+/);
+  const [cronMin, cronHour, _dom, _month, cronDow] = parts;
+
+  // Determine schedule type and time
+  let scheduleArgs: string[] = [];
+
+  if (cronMin.startsWith("*/")) {
+    // Interval-based: e.g., "*/30 9-18 * * *"
+    const intervalMin = parseInt(cronMin.substring(2));
+    // Parse hour range
+    let startHour = "09:00";
+    let endHour = "18:00";
+    if (cronHour.includes("-")) {
+      const [h1, h2] = cronHour.split("-").map(Number);
+      startHour = `${String(h1).padStart(2, "0")}:00`;
+      endHour = `${String(h2).padStart(2, "0")}:00`;
+    }
+    scheduleArgs = [
+      "/SC", "MINUTE",
+      "/MO", String(intervalMin),
+      "/ST", startHour,
+      "/ET", endHour,
+    ];
+  } else {
+    // Fixed time: e.g., "0 8 * * 1-5"
+    const hour = String(parseInt(cronHour)).padStart(2, "0");
+    const minute = String(parseInt(cronMin)).padStart(2, "0");
+    const startTime = `${hour}:${minute}`;
+
+    if (cronDow === "1-5") {
+      // Weekdays only
+      scheduleArgs = ["/SC", "WEEKLY", "/D", "MON,TUE,WED,THU,FRI", "/ST", startTime];
+    } else if (cronDow === "*") {
+      // Every day
+      scheduleArgs = ["/SC", "DAILY", "/ST", startTime];
+    } else {
+      scheduleArgs = ["/SC", "DAILY", "/ST", startTime];
+    }
+  }
+
+  // Build the command that the task will run
+  // Use cmd /c to set working directory and load .env
+  const taskCommand = `cmd /c "cd /d "${PROJECT_ROOT}" && "${bunPath}" run ${config.script}"`;
+
+  const result = await run([
+    "schtasks", "/Create",
+    "/TN", taskName,
+    ...scheduleArgs,
+    "/TR", taskCommand,
+    "/F",  // Force overwrite
+  ]);
+
+  if (result.ok) {
+    console.log(`  ${PASS} ${config.name} scheduled — ${config.description}`);
+    console.log(`      ${dim(`Windows Task: ${taskName}`)}`);
+    return true;
+  }
+
+  // schtasks can be finicky — fall back to showing manual instructions
+  console.log(`  ${FAIL} Could not create scheduled task automatically`);
+  console.log(`      ${dim(`Error: ${result.stderr.substring(0, 100)}`)}`);
+  console.log(`      ${dim(`Manual: schtasks /Create /TN ${taskName} ${scheduleArgs.join(" ")} /TR "${bunPath} run ${scriptPath}"`)}`);
+  return false;
+}
 
 async function checkPm2(): Promise<boolean> {
   const result = await run(["npx", "pm2", "--version"]);
@@ -78,7 +158,10 @@ async function checkPm2(): Promise<boolean> {
 
 async function installService(config: ServiceDef): Promise<boolean> {
   if (config.cron) {
-    // Scheduled service — show cron instructions
+    if (process.platform === "win32") {
+      return installWindowsScheduledTask(config);
+    }
+    // Linux: show cron instructions
     console.log(`  ${PASS} ${config.name}: add to crontab manually`);
     console.log(`      ${dim(`${config.cron} cd ${PROJECT_ROOT} && bun run ${config.script}`)}`);
     return true;

@@ -6,7 +6,7 @@
  * The call-server.ts WebSocket server handles the AI conversation.
  *
  * Voice strategy:
- *   ConversationRelay → Google Chirp3-HD (warm, expressive, multilingual)
+ *   ConversationRelay → ElevenLabs (most natural, human-like — Twilio default)
  *   Fallback <Say>    → Amazon Polly Neural (reliable, always works)
  */
 
@@ -22,10 +22,13 @@ const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_PHONE_NUMBER || "";
 
-// Google Chirp3-HD voice for ConversationRelay
-// Aoede = warm, expressive female voice (works across all languages)
-// Format for ConversationRelay: "locale-Chirp3-HD-VoiceName"
-const CHIRP_VOICE = "Aoede";
+// ElevenLabs FEMALE voices for ConversationRelay (Ona is a woman!)
+// Warm, natural, conversational voices — no API key needed (Twilio built-in)
+const ELEVENLABS_VOICES: Record<string, string> = {
+  pt: "QJd9SLe6MVCdF6DR0EAu",  // Amora Faria (soft, sweet, warm Brazilian female)
+  en: "MnUw1cSnpiLoLhpd3Hqp",  // English female voice (selected by Gil)
+  es: "86V9x9hrQds83qf7zaGn",  // Spanish female voice (selected by Gil)
+};
 
 // Amazon Polly Neural voices for <Say> fallback (per language)
 const POLLY_FALLBACK: Record<string, string> = {
@@ -91,14 +94,14 @@ export async function makeCall(
   let twiml: string;
 
   if (ngrokUrl) {
-    // Interactive call via ConversationRelay with Google Chirp3-HD
+    // Interactive call via ConversationRelay with ElevenLabs (most natural)
     const wsUrl = `${ngrokUrl}/conversation?reason=${encodeURIComponent(message)}&lang=${detectedLang}`;
 
     // Build a natural welcome greeting
     const greeting = buildGreeting(message, detectedLang);
 
-    // Google Chirp3-HD voice: "locale-Chirp3-HD-VoiceName"
-    const chirpVoiceId = `${langCode}-Chirp3-HD-${CHIRP_VOICE}`;
+    // ElevenLabs voice ID per language (Twilio built-in, no API key needed)
+    const voiceId = ELEVENLABS_VOICES[detectedLang] || ELEVENLABS_VOICES.en;
 
     twiml =
       `<Response>` +
@@ -107,16 +110,16 @@ export async function makeCall(
       `url="${escapeXml(wsUrl)}" ` +
       `welcomeGreeting="${escapeXml(greeting)}" ` +
       `welcomeGreetingInterruptible="any" ` +
-      `ttsProvider="Google" ` +
-      `voice="${chirpVoiceId}" ` +
-      `transcriptionLanguage="${langCode}" ` +
+      `ttsProvider="ElevenLabs" ` +
+      `voice="${voiceId}" ` +
+      `language="${langCode}" ` +
       `interruptible="any" ` +
       `interruptSensitivity="high" ` +
       `/>` +
       `</Connect>` +
       `</Response>`;
 
-    console.log(`Initiating INTERACTIVE call to ${cleanNumber} (voice: ${chirpVoiceId}, ws: ${wsUrl.substring(0, 60)}...)`);
+    console.log(`Initiating INTERACTIVE call to ${cleanNumber} (voice: ElevenLabs/${voiceId}, lang: ${langCode}, ws: ${wsUrl.substring(0, 60)}...)`);
   } else {
     // Fallback: one-way call with <Say> using Amazon Polly Neural
     const pollyVoice = POLLY_FALLBACK[detectedLang] || POLLY_FALLBACK.en;

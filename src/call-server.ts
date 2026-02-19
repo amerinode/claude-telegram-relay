@@ -88,6 +88,13 @@ function needsMs365(message: string): boolean {
     /\bwhen is my next\b/i,
     /\binbox\b/i,
     /\boutlook\b/i,
+    // To Do / Tasks
+    /\b(show|list|check|get|read|add|create|complete|done|finish)\b.{0,20}\b(tasks?|to-?dos?)\b/i,
+    /\b(tasks?|to-?dos?)\b.{0,20}\b(list|pending|today|overdue|due)\b/i,
+    /\b(my (tasks?|to-?dos?|to do list))\b/i,
+    /\b(tarefas?|lista de tarefas?|pendências|afazeres)\b/i,
+    /\bwhat do i (need|have) to do\b/i,
+    /\b(o que|que).{0,10}(preciso|tenho que) fazer\b/i,
   ];
 
   return ms365ActionPatterns.some(p => p.test(message));

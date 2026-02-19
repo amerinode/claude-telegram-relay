@@ -13,7 +13,7 @@ import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
-import { synthesize } from "./tts.ts";
+import { synthesizeWithInfo } from "./tts.ts";
 import {
   processMemoryIntents,
   getMemoryContext,
@@ -28,6 +28,8 @@ import {
   declineCalendarEvent,
   sendEmail,
   createDraft,
+  createTask,
+  completeTask,
 } from "./ms365.ts";
 import { generateDocx } from "./document.ts";
 import { generateXlsx } from "./spreadsheet.ts";
@@ -313,6 +315,15 @@ function needsMs365(message: string): boolean {
     /\b(add|put).{0,15}(calendar|my cal)\b/i,
     // Confirm/accept meetings
     /\b(accept|confirm|rsvp|decline)\b.{0,20}\b(meeting|event|invite|calendar)\b/i,
+    // To Do / Tasks
+    /\b(show|list|check|get|read|open|add|create|complete|done|finish|delete|remove)\b.{0,20}\b(tasks?|to-?dos?)\b/i,
+    /\b(tasks?|to-?dos?)\b.{0,20}\b(list|pending|today|overdue|due|completed|done)\b/i,
+    /\b(my (tasks?|to-?dos?|to do list))\b/i,
+    /\b(tarefas?|lista de tarefas?|pendências|afazeres)\b/i,
+    /\b(add|create|adicionar|criar|nova)\b.{0,20}\b(task|to-?do|tarefa)\b/i,
+    /\b(complete|done|finish|conclu[ií]|feito|pronto)\b.{0,20}\b(task|to-?do|tarefa)\b/i,
+    /\bwhat do i (need|have) to do\b/i,
+    /\b(o que|que).{0,10}(preciso|tenho que) fazer\b/i,
   ];
 
   return ms365ActionPatterns.some(p => p.test(message));
@@ -413,6 +424,63 @@ async function processMs365Actions(response: string): Promise<string> {
     } catch (error: any) {
       console.error("Create draft error:", error.message);
       clean = clean.replace(match[0], `❌ Could not create draft: ${error.message}`);
+    }
+  }
+
+  // [CREATE_TASK: list name | title | optional due date YYYY-MM-DD]
+  // Also supports old format: [CREATE_TASK: title | due date] (no list name)
+  for (const match of response.matchAll(/\[CREATE_TASK:\s*(.+?)\s*(?:\|\s*(.+?)\s*)?(?:\|\s*(.+?)\s*)?\]/gi)) {
+    try {
+      let listNameParam: string | undefined;
+      let title: string;
+      let dueDate: string | undefined;
+
+      if (match[3]) {
+        // 3 parts: list | title | due date
+        listNameParam = match[1].trim();
+        title = match[2].trim();
+        dueDate = match[3].trim();
+      } else if (match[2]) {
+        // 2 parts: could be "list | title" or "title | due date"
+        // If second part looks like a date (YYYY-MM-DD), treat as title | due
+        if (/^\d{4}-\d{2}-\d{2}/.test(match[2].trim())) {
+          title = match[1].trim();
+          dueDate = match[2].trim();
+        } else {
+          listNameParam = match[1].trim();
+          title = match[2].trim();
+        }
+      } else {
+        // 1 part: just title
+        title = match[1].trim();
+      }
+
+      const result = await createTask({
+        title,
+        listName: listNameParam,
+        dueDateTime: dueDate || undefined,
+      });
+      console.log(`Created task: "${result.title}" in list "${result.listName}"`);
+      clean = clean.replace(match[0], `✅ Task created: "${result.title}" in ${result.listName}`);
+    } catch (error: any) {
+      console.error("Create task error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not create task: ${error.message}`);
+    }
+  }
+
+  // [COMPLETE_TASK: search text]
+  for (const match of response.matchAll(/\[COMPLETE_TASK:\s*(.+?)\]/gi)) {
+    try {
+      const result = await completeTask(match[1].trim());
+      if (result) {
+        console.log(`Completed task: ${result.title}`);
+        clean = clean.replace(match[0], `✅ Done: "${result.title}"`);
+      } else {
+        clean = clean.replace(match[0], `❌ Could not find task matching "${match[1].trim()}"`);
+      }
+    } catch (error: any) {
+      console.error("Complete task error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not complete task: ${error.message}`);
     }
   }
 
@@ -696,9 +764,10 @@ bot.on("message:voice", async (ctx) => {
 
     // TTS: reply with voice, matching the user's spoken language
     await ctx.replyWithChatAction("upload_voice");
-    const audio = await synthesize(claudeResponse, detectedLang);
-    if (audio) {
-      await ctx.replyWithVoice(new InputFile(audio, "response.ogg"));
+    const ttsResult = await synthesizeWithInfo(claudeResponse, detectedLang);
+    if (ttsResult) {
+      console.log(`TTS: ${ttsResult.provider} → ${ttsResult.filename} (${ttsResult.audio.length} bytes)`);
+      await ctx.replyWithVoice(new InputFile(ttsResult.audio, ttsResult.filename));
     } else {
       // Fallback to text if TTS fails
       await sendResponse(ctx, claudeResponse);

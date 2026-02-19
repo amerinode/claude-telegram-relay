@@ -1,56 +1,73 @@
 /**
  * TTS Test
  *
- * Verifies that Groq TTS is configured correctly.
+ * Verifies that text-to-speech is configured correctly.
+ * Tests ElevenLabs (primary) or Google Cloud (fallback).
  * Run: bun run test:tts
  */
 
 import "dotenv/config";
+import { synthesizeWithInfo, getTtsProvider, detectLanguage } from "../src/tts.ts";
 
 async function testTts(): Promise<boolean> {
-  // Check GROQ_API_KEY
-  if (!process.env.GROQ_API_KEY) {
-    console.error("GROQ_API_KEY is not set in .env");
-    return false;
-  }
-  console.log("GROQ_API_KEY: set");
+  const provider = getTtsProvider();
 
-  // Check ffmpeg (required for WAV → OGG Opus conversion)
-  try {
-    const proc = Bun.spawn(["ffmpeg", "-version"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    await proc.exited;
-    console.log("ffmpeg: installed");
-  } catch {
-    console.error(
-      "ffmpeg: NOT FOUND — install with: brew install ffmpeg (macOS), apt install ffmpeg (Linux), or winget install ffmpeg (Windows)"
-    );
+  if (!provider) {
+    console.error("No TTS provider configured!");
+    console.error("  Option 1: Set ELEVENLABS_API_KEY in .env (recommended — most natural voices)");
+    console.error("            Get a free key at: elevenlabs.io → Profile → API Keys");
+    console.error("  Option 2: Add Google Cloud credentials at config/google-tts-credentials.json");
     return false;
   }
 
-  // Generate a test audio clip
-  console.log("\nGenerating test audio...");
-  try {
-    const { synthesize } = await import("../src/tts.ts");
-    const audio = await synthesize("Hello, this is a TTS test.");
+  console.log(`Provider: ${provider === "elevenlabs" ? "ElevenLabs (most natural)" : "Google Cloud (fallback)"}`);
 
-    if (!audio) {
-      console.error("TTS returned no audio. Check GROQ_API_KEY and model availability.");
+  if (provider === "elevenlabs") {
+    console.log("API Key: set");
+  }
+
+  // Test language detection
+  console.log("\nLanguage detection:");
+  console.log(`  "Olá, tudo bem?" → ${detectLanguage("Olá, tudo bem?")}`);
+  console.log(`  "Hello, how are you?" → ${detectLanguage("Hello, how are you?")}`);
+  console.log(`  "Hola, ¿cómo estás?" → ${detectLanguage("Hola, ¿cómo estás?")}`);
+
+  // Generate test audio in Portuguese (primary use case)
+  console.log("\nGenerating test audio (Portuguese)...");
+  try {
+    const result = await synthesizeWithInfo("Oi Gil, tudo bem? Aqui é a Ona, sua assistente.");
+
+    if (!result) {
+      console.error("TTS returned no audio. Check your credentials.");
       return false;
     }
 
-    console.log(`Audio generated: ${(audio.length / 1024).toFixed(1)} KB`);
+    console.log(`  Provider: ${result.provider}`);
+    console.log(`  Format: ${result.format}`);
+    console.log(`  File: ${result.filename}`);
+    console.log(`  Size: ${(result.audio.length / 1024).toFixed(1)} KB`);
 
-    // Verify it starts with OGG magic bytes (OggS)
-    if (audio[0] === 0x4f && audio[1] === 0x67 && audio[2] === 0x67 && audio[3] === 0x53) {
-      console.log("Format: valid OGG container (Telegram compatible)");
-    } else {
-      console.error(
-        `Format: unexpected header [${audio[0]?.toString(16)}, ${audio[1]?.toString(16)}, ${audio[2]?.toString(16)}, ${audio[3]?.toString(16)}] — expected OGG (4f 67 67 53)`
-      );
-      return false;
+    // Verify audio format
+    if (result.format === "mp3") {
+      // MP3 files start with ID3 tag (49 44 33) or MPEG sync word (ff fb)
+      const isMP3 =
+        (result.audio[0] === 0x49 && result.audio[1] === 0x44 && result.audio[2] === 0x33) ||
+        (result.audio[0] === 0xff && (result.audio[1] & 0xe0) === 0xe0);
+      if (isMP3) {
+        console.log("  Header: valid MP3 (Telegram compatible)");
+      } else {
+        console.error(`  Header: unexpected [${result.audio[0]?.toString(16)}, ${result.audio[1]?.toString(16)}]`);
+        return false;
+      }
+    } else if (result.format === "ogg") {
+      // OGG starts with "OggS" (4f 67 67 53)
+      const isOGG = result.audio[0] === 0x4f && result.audio[1] === 0x67 && result.audio[2] === 0x67 && result.audio[3] === 0x53;
+      if (isOGG) {
+        console.log("  Header: valid OGG (Telegram compatible)");
+      } else {
+        console.error(`  Header: unexpected [${result.audio[0]?.toString(16)}, ${result.audio[1]?.toString(16)}]`);
+        return false;
+      }
     }
 
     return true;
@@ -62,18 +79,13 @@ async function testTts(): Promise<boolean> {
 
 // ---- Main ----
 
-console.log("TTS Test\n");
-
-const voice = process.env.TTS_VOICE || "hannah";
-const model = process.env.TTS_MODEL || "canopylabs/orpheus-v1-english";
-console.log(`Model: ${model}`);
-console.log(`Voice: ${voice}\n`);
+console.log("=== TTS Test ===\n");
 
 const passed = await testTts();
 
 if (passed) {
-  console.log("\nTTS is ready. Voice replies will work on Telegram.");
+  console.log("\n✅ TTS is ready. Voice replies will work on Telegram.");
 } else {
-  console.error("\nTTS test failed. Fix the issues above.");
+  console.error("\n❌ TTS test failed. Fix the issues above.");
   process.exit(1);
 }
