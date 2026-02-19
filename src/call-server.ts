@@ -70,7 +70,14 @@ function needsMs365(message: string): boolean {
   const ms365ActionPatterns = [
     /\b(show|read|check|fetch|list|open|get|find|search|send|forward|reply|delete|move|compose|draft|write)\b.{0,20}\b(emails?|e-mails?|mails?|inbox|messages?)\b/i,
     /\b(emails?|e-mails?|mails?|inbox)\b.{0,20}\b(from|to|today|this week|unread|latest|recent|new)\b/i,
+    // Reverse order: "new emails", "any new emails", "latest emails"
+    /\b(any |)(new|latest|recent|unread)\b.{0,10}\b(emails?|e-mails?|mails?)\b/i,
     /\b(enviar|ler|buscar|mostrar|abrir|verificar|checar|mandar)\b.{0,20}\b(emails?|e-mails?)\b/i,
+    // Portuguese email patterns
+    /\b(novos?|últimos?|recentes?)\b.{0,10}\b(emails?|e-mails?)\b/i,
+    /\b(emails?|e-mails?)\b.{0,10}\b(novos?|recentes?|de hoje)\b/i,
+    /\b(meus? emails?|meus? e-mails?)\b/i,
+    // Calendar
     /\b(show|check|what'?s on|list|open|get|add|create|schedule|cancel|remove|move|reschedule|book)\b.{0,20}\b(calendars?|schedule|agenda|meetings?|events?|appointments?|lunch|dinner|call)\b/i,
     /\b(next|upcoming|today'?s?|this week'?s?)\b.{0,20}\b(meetings?|events?|appointments?|calls?)\b/i,
     /\b(meetings?|events?|appointments?)\b.{0,20}\b(today|this week|tomorrow|scheduled)\b/i,

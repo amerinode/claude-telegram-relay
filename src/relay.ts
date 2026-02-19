@@ -254,16 +254,20 @@ async function callClaude(
     if (exitCode !== 0) {
       console.error(`Claude exit code: ${exitCode}`);
       console.error(`Claude stderr: ${stderr.substring(0, 500)}`);
-      return `Error: ${stderr || "Claude exited with code " + exitCode}`;
+      // Friendly error messages instead of raw error codes
+      if (exitCode === 5) {
+        return "Hmm, I tripped up there — give me one more try? 🔄";
+      }
+      return "Something went wrong on my end. Try again in a sec!";
     }
 
     return output.trim();
   } catch (error: any) {
     console.error("Spawn error:", error?.message || error);
     if (error?.message?.includes("timed out")) {
-      return "Sorry, the request took too long. Please try again with a simpler message.";
+      return "That one took too long — can you try again with something simpler? ⏳";
     }
-    return `Error: Could not run Claude CLI`;
+    return "Oops, I couldn't process that. Try again in a moment!";
   }
 }
 
@@ -283,7 +287,13 @@ function needsMs365(message: string): boolean {
     // Email actions: fetch, read, check, show, open, list, send, delete, forward
     /\b(show|read|check|fetch|list|open|get|find|search|send|forward|reply|delete|move|compose|draft|write)\b.{0,20}\b(emails?|e-mails?|mails?|inbox|messages?)\b/i,
     /\b(emails?|e-mails?|mails?|inbox)\b.{0,20}\b(from|to|today|this week|unread|latest|recent|new)\b/i,
+    // Reverse order: "new emails", "any new emails", "latest emails"
+    /\b(any |)(new|latest|recent|unread)\b.{0,10}\b(emails?|e-mails?|mails?)\b/i,
     /\b(enviar|ler|buscar|mostrar|abrir|verificar|checar|mandar)\b.{0,20}\b(emails?|e-mails?)\b/i,
+    // Portuguese email patterns: "novos emails", "emails novos", "meus emails"
+    /\b(novos?|últimos?|recentes?)\b.{0,10}\b(emails?|e-mails?)\b/i,
+    /\b(emails?|e-mails?)\b.{0,10}\b(novos?|recentes?|de hoje)\b/i,
+    /\b(meus? emails?|meus? e-mails?)\b/i,
     // Calendar actions: check, show, what's on, schedule, add, create, cancel
     /\b(show|check|what'?s on|list|open|get|add|create|schedule|cancel|remove|move|reschedule|book)\b.{0,20}\b(calendars?|schedule|agenda|meetings?|events?|appointments?|lunch|dinner|call)\b/i,
     /\b(add|create|schedule|book|set up|cancel|reschedule)\b.{0,30}\b(at|for|on|today|tomorrow|noon|morning|afternoon)\b/i,
