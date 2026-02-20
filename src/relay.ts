@@ -661,6 +661,54 @@ function buildPrompt(
 }
 
 async function sendResponse(ctx: Context, response: string): Promise<void> {
+  // Extract image URLs from response and send them as photos
+  // Matches markdown images: ![alt](url) and standalone image URLs on their own line
+  const markdownImageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  const standaloneImageUrlRegex = /^(https?:\/\/\S+\.(?:png|jpg|jpeg|gif|webp|bmp|tiff)(?:\?\S*)?)$/gim;
+
+  // Collect all image URLs and their positions
+  const images: { url: string; caption: string; fullMatch: string }[] = [];
+
+  for (const match of response.matchAll(markdownImageRegex)) {
+    images.push({ url: match[2], caption: match[1], fullMatch: match[0] });
+  }
+
+  // Also find standalone image URLs (not already captured in markdown syntax)
+  for (const match of response.matchAll(standaloneImageUrlRegex)) {
+    const url = match[1];
+    if (!images.some((img) => img.url === url)) {
+      images.push({ url, caption: "", fullMatch: match[0] });
+    }
+  }
+
+  // Remove image references from text to avoid sending them as raw text
+  let textResponse = response;
+  for (const img of images) {
+    textResponse = textResponse.replace(img.fullMatch, "").trim();
+  }
+  // Clean up leftover blank lines from removal
+  textResponse = textResponse.replace(/\n{3,}/g, "\n\n").trim();
+
+  // Send text portion if any
+  if (textResponse) {
+    await sendTextResponse(ctx, textResponse);
+  }
+
+  // Send each image as a photo
+  for (const img of images) {
+    try {
+      await ctx.replyWithChatAction("upload_photo");
+      const caption = img.caption || undefined;
+      await ctx.replyWithPhoto(img.url, { caption });
+    } catch (error) {
+      console.error(`Failed to send image ${img.url}:`, error);
+      // Fallback: send the URL as text so the user can still access it
+      await ctx.reply(img.caption ? `${img.caption}: ${img.url}` : img.url);
+    }
+  }
+}
+
+async function sendTextResponse(ctx: Context, response: string): Promise<void> {
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
 
