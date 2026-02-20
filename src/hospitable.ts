@@ -39,6 +39,20 @@ export interface Property {
   checkout?: string;
 }
 
+export interface ReservationFinancials {
+  currency?: string;
+  accommodation?: string;       // formatted: "R$16,140.00"
+  nightlyRate?: string;         // formatted: "R$3,228.00" avg
+  cleaningFee?: string;         // formatted: "R$440.00"
+  otherFees?: string[];         // ["Pet Fee: R$400.00"]
+  guestServiceFee?: string;     // formatted: "R$2,397.19"
+  guestTotal?: string;          // formatted: "R$19,708.72"
+  hostServiceFee?: string;      // formatted: "-R$679.20"
+  hostRevenue?: string;         // formatted: "R$16,300.80"
+  nightlyBreakdown?: string[];  // ["2026-02-18: R$4,700.00", ...]
+  nights?: number;
+}
+
 export interface Reservation {
   id: string;
   code: string;
@@ -52,6 +66,7 @@ export interface Reservation {
   propertyName?: string;
   conversationId?: string;
   lastMessageAt?: string;
+  financials?: ReservationFinancials;
 }
 
 export interface GuestMessage {
@@ -101,7 +116,7 @@ export async function listReservations(options?: {
 }): Promise<Reservation[]> {
   const params = new URLSearchParams();
   params.set("per_page", String(options?.limit || 20));
-  params.set("include", "guest,properties");
+  params.set("include", "guest,properties,financials");
 
   if (options?.propertyIds?.length) {
     for (const id of options.propertyIds) {
@@ -120,7 +135,7 @@ export async function listReservations(options?: {
  */
 export async function getReservation(uuid: string): Promise<Reservation | null> {
   try {
-    const data = await hospitable("GET", `/reservations/${uuid}?include=guest,properties`);
+    const data = await hospitable("GET", `/reservations/${uuid}?include=guest,properties,financials`);
     const reservations = parseReservations(data);
     return reservations[0] || null;
   } catch {
@@ -171,15 +186,38 @@ export function needsHospitable(message: string): boolean {
     /\b(airbnb|hospitable)\b/i,
     /\b(check.?in|check.?out|checkout)\b/i,
     /\b(reserv(ation|a)(tion|s|ções)?|booking|hospedagem)\b/i,
+    /\b(hosped(ado|ando|ar|ados|adas)?)\b/i, // hospedado, hospedando, hospedar...
+    /\b(hosting|hosted|staying|stayed)\b/i,
     /\b(reply|respond|responda?|contesta?)\b.{0,30}\b(guest|hóspede|message|mensagem)\b/i,
-    /\b(who|quem).{0,20}(arriving|checking|chegando|entrando)\b/i,
+    /\b(who|quem).{0,20}(arriving|checking|chegando|entrando|hosped|staying)\b/i,
     /\b(property|propriedade|imóvel|listing|anúncio)s?\b/i,
     /\b(ocupação|occupancy|disponibilidade|availability)\b/i,
+    /\b(pricing|price|preço|valor|custo|cost|payout|revenue|receita|faturamento|financ\w*|breakdown)\b/i,
     /\b(mensagem|message)\b.{0,20}\b(do|da|from|del)\b.{0,20}\b(hóspede|guest|huésped)\b/i,
     /\b(próximo|next|upcoming)\b.{0,20}\b(hóspede|guest|reserva|booking)\b/i,
   ];
 
   return patterns.some((p) => p.test(lower));
+}
+
+/**
+ * Format financial data as context lines for Claude.
+ */
+function formatFinancialContext(f: ReservationFinancials): string {
+  const parts: string[] = [];
+  let line = "    💰 ";
+  if (f.accommodation) line += `Accommodation: ${f.accommodation}`;
+  if (f.nightlyRate) line += ` (avg ${f.nightlyRate}/night)`;
+  if (f.cleaningFee) line += ` | Cleaning: ${f.cleaningFee}`;
+  if (f.otherFees?.length) line += ` | ${f.otherFees.join(", ")}`;
+  if (f.guestTotal) line += ` | Guest total: ${f.guestTotal}`;
+  if (f.hostRevenue) line += ` | Your payout: ${f.hostRevenue}`;
+  if (f.hostServiceFee) line += ` (after ${f.hostServiceFee} host fee)`;
+  parts.push(line);
+  if (f.nightlyBreakdown?.length) {
+    parts.push(`    📅 Per-night: ${f.nightlyBreakdown.join(", ")}`);
+  }
+  return parts.join("\n");
 }
 
 /**
@@ -218,24 +256,24 @@ export async function handleHospitableRequest(
 
     // Check for reservation/guest intent
     const wantsReservations =
-      /\b(reserv\w*|booking|check.?in|check.?out|guest|hóspede|huésped|arriving|quem|who|próximo|next|upcoming)\b/i.test(
+      /\b(reserv\w*|booking|check.?in|check.?out|guest|hóspede|huésped|arriving|quem|who|próximo|next|upcoming|hosped\w*|hosting|hosted|staying|pricing|price|preço|valor|custo|cost|payout|revenue|financ\w*)\b/i.test(
         lower
       );
 
     if (wantsReservations && propertyIds.length) {
       // Get current and upcoming reservations (next 30 days)
       // Use 30 days ago as startDate to catch guests who checked in earlier and are still staying
-      const sevenDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
         .toISOString()
         .split("T")[0];
-      const thirtyDays = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+      const thirtyDaysAhead = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
         .toISOString()
         .split("T")[0];
 
       const reservations = await listReservations({
         propertyIds,
-        startDate: sevenDaysAgo,
-        endDate: thirtyDays,
+        startDate: thirtyDaysAgo,
+        endDate: thirtyDaysAhead,
         limit: 20,
       });
 
@@ -251,9 +289,13 @@ export async function handleHospitableRequest(
           for (const r of active) {
             parts.push(
               `  - ${r.guestName || "Guest"} at ${r.propertyName || "Property"}: ` +
-                `checked in ${r.arrivalDate}, checking out ${r.departureDate} (${r.platform}, ${r.status})` +
+                `checked in ${r.arrivalDate}, checking out ${r.departureDate}` +
+                ` (${r.guestCount ? r.guestCount + " guests, " : ""}${r.platform}, ${r.status})` +
                 ` [reservation_id: ${r.id}]`
             );
+            if (r.financials) {
+              parts.push(formatFinancialContext(r.financials));
+            }
           }
         }
 
@@ -262,9 +304,13 @@ export async function handleHospitableRequest(
           for (const r of upcoming) {
             parts.push(
               `  - ${r.guestName || "Guest"} at ${r.propertyName || "Property"}: ` +
-                `${r.arrivalDate} → ${r.departureDate} (${r.platform}, ${r.status})` +
+                `${r.arrivalDate} → ${r.departureDate}` +
+                ` (${r.guestCount ? r.guestCount + " guests, " : ""}${r.platform}, ${r.status})` +
                 ` [reservation_id: ${r.id}]`
             );
+            if (r.financials) {
+              parts.push(formatFinancialContext(r.financials));
+            }
           }
         }
 
@@ -439,20 +485,50 @@ function parseProperties(data: any): Property[] {
 function parseReservations(data: any): Reservation[] {
   const items = Array.isArray(data.data) ? data.data : [];
 
-  return items.map((r: any) => ({
-    id: r.id,
-    code: r.code || "",
-    platform: r.platform || "airbnb",
-    status: r.reservation_status?.current?.category || r.status || "",
-    arrivalDate: r.arrival_date?.split("T")[0] || "",
-    departureDate: r.departure_date?.split("T")[0] || "",
-    guestName: r.guest?.first_name || undefined,
-    guestCount: r.guests?.total || undefined,
-    propertyId: r.properties?.[0]?.id || undefined,
-    propertyName: r.properties?.[0]?.name || undefined,
-    conversationId: r.conversation_id || undefined,
-    lastMessageAt: r.last_message_at || undefined,
-  }));
+  return items.map((r: any) => {
+    // Financial data — Hospitable returns nested: financials.guest / financials.host
+    const fin = r.financials;
+    const nights = r.nights || (r.arrival_date && r.departure_date
+      ? Math.round((new Date(r.departure_date).getTime() - new Date(r.arrival_date).getTime()) / (1000 * 60 * 60 * 24))
+      : undefined);
+    const guestFees = fin?.guest?.fees || [];
+    const financials: ReservationFinancials | undefined = fin
+      ? {
+          currency: fin.currency || undefined,
+          accommodation: fin.guest?.accommodation?.formatted || undefined,
+          nightlyRate: fin.guest?.average_nightly_rate?.formatted || undefined,
+          cleaningFee: guestFees.find((f: any) => /clean/i.test(f.label))?.formatted || undefined,
+          otherFees: guestFees
+            .filter((f: any) => !/clean/i.test(f.label) && !/service/i.test(f.category))
+            .map((f: any) => `${f.label}: ${f.formatted}`)
+            .filter((s: string) => s) || undefined,
+          guestServiceFee: guestFees.find((f: any) => /service/i.test(f.category))?.formatted || undefined,
+          guestTotal: fin.guest?.total_price?.formatted || undefined,
+          hostServiceFee: fin.host?.host_fees?.[0]?.formatted || undefined,
+          hostRevenue: fin.host?.revenue?.formatted || undefined,
+          nightlyBreakdown: fin.host?.accommodation_breakdown?.map(
+            (n: any) => `${n.label}: ${n.formatted}`
+          ) || undefined,
+          nights,
+        }
+      : undefined;
+
+    return {
+      id: r.id,
+      code: r.code || "",
+      platform: r.platform || "airbnb",
+      status: r.reservation_status?.current?.category || r.status || "",
+      arrivalDate: r.arrival_date?.split("T")[0] || "",
+      departureDate: r.departure_date?.split("T")[0] || "",
+      guestName: r.guest?.first_name || undefined,
+      guestCount: r.guests?.total || undefined,
+      propertyId: r.properties?.[0]?.id || undefined,
+      propertyName: r.properties?.[0]?.name || undefined,
+      conversationId: r.conversation_id || undefined,
+      lastMessageAt: r.last_message_at || undefined,
+      financials,
+    };
+  });
 }
 
 /**
