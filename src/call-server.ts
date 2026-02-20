@@ -225,6 +225,91 @@ async function handleGuestWebhook(payload: any): Promise<void> {
   console.log(`Hospitable: sent draft to Telegram for approval (reservation: ${info.reservationId})`);
 }
 
+/**
+ * Handle new/changed reservation from Hospitable webhook.
+ * Sends a Telegram notification with reservation details.
+ */
+async function handleReservationWebhook(payload: any, isNew: boolean): Promise<void> {
+  const data = payload.data || payload;
+
+  const guestName = data.guest?.first_name || data.guest_name || data.guest?.name || "Guest";
+  const propertyName = data.properties?.[0]?.name || data.property_name || data.property?.name || "Property";
+  const platform = data.platform || "airbnb";
+  const status = data.reservation_status?.current?.category || data.status || "";
+  const arrivalDate = (data.arrival_date || "").split("T")[0];
+  const departureDate = (data.departure_date || "").split("T")[0];
+  const nights = data.nights || "";
+  const guestCount = data.guests?.total || "";
+  const code = data.code || "";
+
+  // Financial info (if included)
+  const fin = data.financials;
+  const hostRevenue = fin?.host?.revenue?.formatted || "";
+  const guestTotal = fin?.guest?.total_price?.formatted || "";
+
+  const emoji = isNew ? "🎉" : "🔄";
+  const action = isNew ? "New reservation" : "Reservation updated";
+
+  let text =
+    `${emoji} <b>${action}!</b>\n` +
+    `🏠 ${escapeHtml(propertyName)}\n` +
+    `👤 ${escapeHtml(guestName)}` +
+    (guestCount ? ` (${guestCount} guests)` : "") + `\n` +
+    `📅 ${arrivalDate} → ${departureDate}` +
+    (nights ? ` (${nights} nights)` : "") + `\n` +
+    `📋 ${platform} · ${status}`;
+
+  if (code) text += ` · ${code}`;
+  if (hostRevenue) text += `\n💰 Payout: ${hostRevenue}`;
+  else if (guestTotal) text += `\n💰 Guest total: ${guestTotal}`;
+
+  console.log(`Hospitable webhook: ${action} — ${guestName} @ ${propertyName} (${arrivalDate} → ${departureDate})`);
+  await sendTelegram(text);
+}
+
+/**
+ * Handle new review from Hospitable webhook.
+ * Sends a Telegram notification with review content.
+ */
+async function handleReviewWebhook(payload: any): Promise<void> {
+  const data = payload.data || payload;
+
+  const guestName = data.guest?.first_name || data.guest_name || data.reviewer_name || data.reviewer || "Guest";
+  const propertyName = data.properties?.[0]?.name || data.property_name || data.property?.name || data.listing_name || "Property";
+  const platform = data.platform || "airbnb";
+  const rating = data.rating || data.overall_rating || data.stars || "";
+  const publicReview = data.public_review || data.review_text || data.body || data.content || "";
+  const privateNote = data.private_feedback || data.private_review || data.private_note || "";
+  const categories = data.category_ratings || data.categories || null;
+
+  let text =
+    `⭐ <b>New review!</b>\n` +
+    `🏠 ${escapeHtml(propertyName)}\n` +
+    `👤 ${escapeHtml(guestName)} (${platform})`;
+
+  if (rating) text += `\n⭐ Rating: ${rating}/5`;
+
+  if (categories && typeof categories === "object") {
+    const cats = Object.entries(categories)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(", ");
+    if (cats) text += `\n📊 ${cats}`;
+  }
+
+  if (publicReview) {
+    const preview = publicReview.length > 300 ? publicReview.substring(0, 300) + "..." : publicReview;
+    text += `\n\n💬 <i>"${escapeHtml(preview)}"</i>`;
+  }
+
+  if (privateNote) {
+    const preview = privateNote.length > 200 ? privateNote.substring(0, 200) + "..." : privateNote;
+    text += `\n\n🔒 <b>Private note:</b> <i>"${escapeHtml(preview)}"</i>`;
+  }
+
+  console.log(`Hospitable webhook: New review from ${guestName} @ ${propertyName}`);
+  await sendTelegram(text);
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, "&amp;")
@@ -512,18 +597,32 @@ const server = Bun.serve({
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
-    // Hospitable webhook — receives guest messages from Airbnb via Hospitable
+    // Hospitable webhook — receives guest messages, reservations, reviews from Hospitable
     if (url.pathname === "/hospitable-webhook" && req.method === "POST") {
       try {
         const payload = await req.json();
         const eventType = payload.event || payload.type || "";
         console.log(`Hospitable webhook received: ${eventType}`);
 
+        // Process in background — don't block the webhook response
         if (eventType === "message.created") {
-          // Process in background — don't block the webhook response
           handleGuestWebhook(payload).catch((e) =>
             console.error(`Hospitable webhook handler error: ${e.message}`)
           );
+        } else if (eventType === "reservation.created") {
+          handleReservationWebhook(payload, true).catch((e) =>
+            console.error(`Hospitable reservation webhook error: ${e.message}`)
+          );
+        } else if (eventType === "reservation.changed") {
+          handleReservationWebhook(payload, false).catch((e) =>
+            console.error(`Hospitable reservation webhook error: ${e.message}`)
+          );
+        } else if (eventType === "review.created") {
+          handleReviewWebhook(payload).catch((e) =>
+            console.error(`Hospitable review webhook error: ${e.message}`)
+          );
+        } else {
+          console.log(`Hospitable webhook: unhandled event type "${eventType}"`);
         }
 
         return new Response(JSON.stringify({ status: "ok" }), {
