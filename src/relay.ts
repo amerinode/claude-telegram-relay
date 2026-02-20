@@ -401,34 +401,45 @@ bot.on("message:text", async (ctx) => {
 
   await ctx.replyWithChatAction("typing");
 
-  await saveMessage("user", text);
+  try {
+    await saveMessage("user", text);
 
-  // Gather context: recent history + semantic search + facts/goals
-  const [recentHistory, relevantContext, memoryContext] = await Promise.all([
-    getRecentHistory(supabase, 20),
-    getRelevantContext(supabase, text),
-    getMemoryContext(supabase),
-  ]);
+    // Gather context: recent history + semantic search + facts/goals
+    const [recentHistory, relevantContext, memoryContext] = await Promise.all([
+      getRecentHistory(supabase, 20),
+      getRelevantContext(supabase, text),
+      getMemoryContext(supabase),
+    ]);
 
-  // Check if we need MS365 data (email/calendar)
-  let ms365Context = "";
-  if (needsMs365(text)) {
-    console.log("MS365 request detected, fetching data via Graph API...");
-    ms365Context = await handleMs365Request(text, recentHistory);
-    console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
+    // Check if we need MS365 data (email/calendar)
+    let ms365Context = "";
+    if (needsMs365(text)) {
+      console.log("MS365 request detected, fetching data via Graph API...");
+      ms365Context = await handleMs365Request(text, recentHistory);
+      console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
+    }
+
+    const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context);
+    const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
+
+    // Process MS365 action tags (create event, accept, send email, etc.)
+    const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
+
+    // Parse and save any memory intents, strip tags from response
+    const response = await processMemoryIntents(supabase, afterActions);
+
+    if (!response) {
+      console.error("Claude returned an empty response");
+      await ctx.reply("I couldn't generate a response. Please try again.");
+      return;
+    }
+
+    await saveMessage("assistant", response);
+    await sendResponse(ctx, response);
+  } catch (error) {
+    console.error("Text message error:", error);
+    await ctx.reply("Something went wrong processing your message. Check logs for details.");
   }
-
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context);
-  const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
-
-  // Process MS365 action tags (create event, accept, send email, etc.)
-  const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
-
-  // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, afterActions);
-
-  await saveMessage("assistant", response);
-  await sendResponse(ctx, response);
 });
 
 // Voice messages
