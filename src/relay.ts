@@ -35,6 +35,12 @@ import { generateDocx } from "./document.ts";
 import { generateXlsx } from "./spreadsheet.ts";
 import { generatePptx } from "./presentation.ts";
 import { makeCall, isCallConfigured } from "./call.ts";
+import {
+  needsHospitable,
+  handleHospitableRequest,
+  isHospitableConfigured,
+  sendMessage as sendHospitableMessage,
+} from "./hospitable.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -702,6 +708,34 @@ async function processCallActions(response: string): Promise<string> {
   return clean;
 }
 
+/**
+ * Process [HOSPITABLE_REPLY: reservation_uuid | message] tags.
+ * Sends a message to a guest via the Hospitable API.
+ */
+async function processHospitableActions(response: string): Promise<string> {
+  if (!isHospitableConfigured()) return response;
+
+  let clean = response;
+
+  const replyRegex = /\[HOSPITABLE_REPLY:\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi;
+
+  for (const match of response.matchAll(replyRegex)) {
+    const reservationId = match[1].trim();
+    const messageBody = match[2].trim();
+
+    try {
+      console.log(`Sending Hospitable reply to reservation ${reservationId}`);
+      await sendHospitableMessage(reservationId, messageBody);
+      clean = clean.replace(match[0], `✅ Message sent to guest`);
+    } catch (error: any) {
+      console.error("Hospitable reply error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not send message: ${error.message}`);
+    }
+  }
+
+  return clean;
+}
+
 // ============================================================
 // MESSAGE HANDLERS
 // ============================================================
@@ -710,6 +744,25 @@ async function processCallActions(response: string): Promise<string> {
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
   console.log(`Message: ${text.substring(0, 50)}...`);
+
+  // Check if user is in "edit reply" mode for Hospitable
+  const userId = ctx.from?.id?.toString() || "";
+  const pendingReservation = hospitable_drafts.get(userId);
+  if (pendingReservation && text.toLowerCase() !== "cancel") {
+    hospitable_drafts.delete(userId);
+    try {
+      await ctx.replyWithChatAction("typing");
+      await sendHospitableMessage(pendingReservation, text);
+      await ctx.reply("✅ Your custom reply was sent to the guest on Airbnb!");
+    } catch (error: any) {
+      await ctx.reply(`❌ Could not send: ${error.message}`);
+    }
+    return;
+  } else if (pendingReservation && text.toLowerCase() === "cancel") {
+    hospitable_drafts.delete(userId);
+    await ctx.reply("Cancelled. Guest reply not sent.");
+    return;
+  }
 
   await ctx.replyWithChatAction("typing");
 
@@ -730,15 +783,26 @@ bot.on("message:text", async (ctx) => {
     console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
   }
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context);
+  // Check if we need Hospitable data (Airbnb guests/reservations)
+  let hospitableContext = "";
+  if (needsHospitable(text)) {
+    console.log("Hospitable request detected, fetching Airbnb data...");
+    hospitableContext = await handleHospitableRequest(text, recentHistory);
+    console.log(`Hospitable context: ${hospitableContext.substring(0, 100)}...`);
+  }
+
+  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext);
   const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
 
   // Process MS365 action tags (create event, accept, send email, draft, etc.)
   // Always check — Claude may emit action tags even without explicit ms365Context
   const afterActions = await processMs365Actions(rawResponse);
 
+  // Process Hospitable action tags (reply to guest)
+  const afterHospitable = await processHospitableActions(afterActions);
+
   // Process document generation tags — sends files via Telegram
-  const afterDocs = await processDocumentActions(ctx, afterActions);
+  const afterDocs = await processDocumentActions(ctx, afterHospitable);
 
   // Process spreadsheet generation tags — sends .xlsx files via Telegram
   const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
@@ -799,16 +863,25 @@ bot.on("message:voice", async (ctx) => {
       ms365Context = await handleMs365Request(transcription, recentHistory);
     }
 
+    // Check if we need Hospitable data (Airbnb guests/reservations)
+    let hospitableContext = "";
+    if (needsHospitable(transcription)) {
+      console.log("Hospitable request detected in voice, fetching Airbnb data...");
+      hospitableContext = await handleHospitableRequest(transcription, recentHistory);
+    }
+
     const enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
       memoryContext,
       recentHistory,
-      ms365Context
+      ms365Context,
+      hospitableContext
     );
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
     const afterActions = await processMs365Actions(rawResponse);
-    const afterDocs = await processDocumentActions(ctx, afterActions);
+    const afterHospitable = await processHospitableActions(afterActions);
+    const afterDocs = await processDocumentActions(ctx, afterHospitable);
     const afterSheets = await processSpreadsheetActions(ctx, afterDocs);
     const afterSlides = await processPresentationActions(ctx, afterSheets);
     const afterCalls = await processCallActions(afterSlides);
@@ -937,7 +1010,8 @@ function buildPrompt(
   relevantContext?: string,
   memoryContext?: string,
   recentHistory?: string,
-  ms365Context?: string
+  ms365Context?: string,
+  hospitableContext?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -984,6 +1058,22 @@ function buildPrompt(
         "\nAlways CONFIRM with the user before sending emails or making calendar changes." +
         "\nFor drafts, you can save directly when the user asks — no confirmation needed since it doesn't send anything." +
         "\nSummarize emails concisely rather than showing raw data."
+    );
+  }
+
+  // Hospitable / Airbnb guest data
+  if (hospitableContext) {
+    parts.push(`\nAIRBNB / HOSPITABLE DATA:\n${hospitableContext}`);
+    parts.push(
+      "\nAIRBNB ACTIONS:" +
+        "\nWhen the user asks you to reply to a guest, send a message to a guest, or respond to a guest, include this tag:" +
+        "\n[HOSPITABLE_REPLY: reservation_uuid | Message to send to guest]" +
+        "\nExample: [HOSPITABLE_REPLY: abc-123-def | Hi Sarah! Check-in is at 3:00 PM. I'll send you the door code the day before your arrival!]" +
+        "\nThe reservation_uuid is shown in the data above as [reservation_id: ...]." +
+        "\nThe message will be sent to the guest on Airbnb via the Hospitable API." +
+        "\nWrite the message as if the HOST is writing it (not Ona). Be warm, professional, and helpful." +
+        "\nAlways CONFIRM with the user before sending a message to a guest." +
+        "\nMatch the guest's language when replying."
     );
   }
 
@@ -1145,12 +1235,65 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 }
 
 // ============================================================
+// INLINE BUTTON CALLBACKS (Hospitable draft approval)
+// ============================================================
+
+// Store for pending draft data: key is callback message text hash
+const hospitable_drafts = new Map<string, string>();
+
+bot.on("callback_query:data", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+
+  if (data.startsWith("hospitable_send:")) {
+    const reservationId = data.replace("hospitable_send:", "");
+
+    // Extract draft from the original message text
+    const messageText = ctx.callbackQuery.message?.text || "";
+    const draftMatch = messageText.match(/Suggested reply:\n([\s\S]+?)$/);
+    const draft = draftMatch?.[1]?.trim();
+
+    if (!draft) {
+      await ctx.answerCallbackQuery({ text: "Could not find draft text" });
+      return;
+    }
+
+    try {
+      await sendHospitableMessage(reservationId, draft);
+      await ctx.answerCallbackQuery({ text: "✅ Message sent to guest!" });
+      // Update the message to show it was sent
+      const originalText = ctx.callbackQuery.message?.text || "";
+      await ctx.editMessageText(originalText + "\n\n✅ Sent!", { parse_mode: undefined });
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    } catch (error: any) {
+      await ctx.answerCallbackQuery({ text: `❌ Error: ${error.message}` });
+    }
+  } else if (data.startsWith("hospitable_edit:")) {
+    const reservationId = data.replace("hospitable_edit:", "");
+    await ctx.answerCallbackQuery({ text: "Type your reply and I'll send it" });
+    // Store the reservation ID so the next message can be used as the reply
+    hospitable_drafts.set(ctx.from?.id?.toString() || "", reservationId);
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    await ctx.reply(`✏️ Type your reply for this guest. I'll send it to Airbnb.\n\n(To cancel, just say "cancel")`);
+  } else if (data.startsWith("hospitable_skip:")) {
+    await ctx.answerCallbackQuery({ text: "Skipped" });
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    const originalText = ctx.callbackQuery.message?.text || "";
+    await ctx.editMessageText(originalText + "\n\n⏭ Skipped", { parse_mode: undefined });
+  } else {
+    await ctx.answerCallbackQuery();
+  }
+});
+
+// ============================================================
 // START
 // ============================================================
 
 console.log("Starting Claude Telegram Relay...");
 console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+if (isHospitableConfigured()) {
+  console.log("Hospitable integration: ENABLED");
+}
 
 bot.start({
   onStart: () => {

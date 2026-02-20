@@ -23,6 +23,13 @@ import {
   getRecentHistory,
 } from "./memory.ts";
 import { handleMs365Request } from "./ms365.ts";
+import {
+  isHospitableConfigured,
+  listMessages,
+  getReservation,
+  sendMessage as sendHospitableMessage,
+  formatWebhookMessage,
+} from "./hospitable.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -36,6 +43,194 @@ const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const USER_NAME = process.env.USER_NAME || "";
 const USER_TIMEZONE =
   process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// ============================================================
+// TELEGRAM (for sending webhook notifications)
+// ============================================================
+
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TG_USER_ID = process.env.TELEGRAM_USER_ID || "";
+
+/**
+ * Send a Telegram message with optional inline keyboard.
+ * Uses raw fetch to avoid importing grammY in the call server.
+ */
+async function sendTelegram(
+  text: string,
+  replyMarkup?: any
+): Promise<any> {
+  if (!TG_TOKEN || !TG_USER_ID) return null;
+  const body: any = {
+    chat_id: TG_USER_ID,
+    text,
+    parse_mode: "HTML",
+  };
+  if (replyMarkup) body.reply_markup = JSON.stringify(replyMarkup);
+
+  const resp = await fetch(
+    `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+  return resp.json();
+}
+
+// ============================================================
+// HOSPITABLE WEBHOOK — Draft storage for auto-reply approval
+// ============================================================
+
+interface DraftReply {
+  reservationId: string;
+  draft: string;
+  guestName: string;
+  propertyName: string;
+  guestMessage: string;
+  createdAt: number;
+}
+
+// Map of reservation UUID → draft reply (cleared after 1 hour)
+export const pendingDrafts = new Map<string, DraftReply>();
+
+// Clean up old drafts every 10 minutes
+setInterval(() => {
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  for (const [key, draft] of pendingDrafts) {
+    if (draft.createdAt < oneHourAgo) pendingDrafts.delete(key);
+  }
+}, 10 * 60 * 1000);
+
+/**
+ * Handle incoming guest message from Hospitable webhook.
+ * 1. Parse the webhook payload
+ * 2. Fetch reservation context
+ * 3. Generate a draft reply via Claude
+ * 4. Send to Telegram with inline buttons
+ */
+async function handleGuestWebhook(payload: any): Promise<void> {
+  const info = formatWebhookMessage(payload);
+  if (!info || !info.messageBody || !info.reservationId) {
+    console.log("Hospitable webhook: no message body or reservation ID, skipping");
+    return;
+  }
+
+  // Skip messages sent by the host (only notify on guest messages)
+  const senderType = payload.data?.sender || payload.data?.direction || "";
+  if (senderType === "host") {
+    console.log("Hospitable webhook: host message, skipping notification");
+    return;
+  }
+
+  console.log(
+    `Hospitable webhook: ${info.guestName} @ ${info.propertyName}: "${info.messageBody.substring(0, 60)}..."`
+  );
+
+  // Fetch recent conversation history for context
+  let conversationContext = "";
+  try {
+    const messages = await listMessages(info.reservationId, 5);
+    if (messages.length) {
+      conversationContext = messages
+        .reverse()
+        .map((m) => `${m.sender === "guest" ? info.guestName : "You"}: ${m.body}`)
+        .join("\n");
+    }
+  } catch (e: any) {
+    console.error(`Hospitable: failed to fetch message history: ${e.message}`);
+  }
+
+  // Generate draft reply via Claude CLI
+  let draftReply = "";
+  try {
+    const draftPrompt = [
+      `You are Ona, a warm and professional Airbnb host assistant.`,
+      `Draft a brief, friendly reply to a guest message.`,
+      ``,
+      `Property: ${info.propertyName}`,
+      `Guest: ${info.guestName}`,
+      `Check-in: ${info.arrivalDate} → Check-out: ${info.departureDate}`,
+      `Platform: ${info.platform}`,
+      conversationContext ? `\nRecent conversation:\n${conversationContext}` : "",
+      ``,
+      `Guest's latest message: "${info.messageBody}"`,
+      ``,
+      `Write a concise, helpful reply (2-4 sentences max). Be warm but professional.`,
+      `Do NOT include greetings like "Dear" or sign-offs like "Best regards".`,
+      `Start with "Hi ${info.guestName}!" and get straight to the point.`,
+      `If you don't have specific info (like door codes, WiFi), say you'll send it closer to check-in.`,
+      `Reply ONLY with the message text, nothing else.`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.CLAUDECODE;
+    delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+
+    const claudeProc = spawn({
+      cmd: [CLAUDE_PATH, "-p", draftPrompt, "--no-session-persistence", "--output-format", "text"],
+      cwd: PROJECT_DIR || PROJECT_ROOT,
+      env: cleanEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const timeout = setTimeout(() => claudeProc.kill(), 30000);
+    const output = await new Response(claudeProc.stdout).text();
+    clearTimeout(timeout);
+
+    draftReply = output.trim();
+    if (!draftReply) draftReply = `Hi ${info.guestName}! Thanks for your message. I'll get back to you shortly.`;
+  } catch (e: any) {
+    console.error(`Hospitable: draft generation failed: ${e.message}`);
+    draftReply = `Hi ${info.guestName}! Thanks for your message. I'll get back to you shortly.`;
+  }
+
+  // Store draft for approval
+  pendingDrafts.set(info.reservationId, {
+    reservationId: info.reservationId,
+    draft: draftReply,
+    guestName: info.guestName,
+    propertyName: info.propertyName,
+    guestMessage: info.messageBody,
+    createdAt: Date.now(),
+  });
+
+  // Format Telegram notification with inline buttons
+  const dateRange =
+    info.arrivalDate && info.departureDate
+      ? ` (${info.arrivalDate} → ${info.departureDate})`
+      : "";
+
+  const telegramText =
+    `📩 <b>New message from ${escapeHtml(info.guestName)}</b>\n` +
+    `🏠 ${escapeHtml(info.propertyName)}${dateRange}\n\n` +
+    `<i>"${escapeHtml(info.messageBody)}"</i>\n\n` +
+    `💬 <b>Suggested reply:</b>\n` +
+    `${escapeHtml(draftReply)}`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: "✅ Send", callback_data: `hospitable_send:${info.reservationId}` },
+        { text: "✏️ Edit", callback_data: `hospitable_edit:${info.reservationId}` },
+        { text: "❌ Skip", callback_data: `hospitable_skip:${info.reservationId}` },
+      ],
+    ],
+  };
+
+  await sendTelegram(telegramText, keyboard);
+  console.log(`Hospitable: sent draft to Telegram for approval (reservation: ${info.reservationId})`);
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 // ============================================================
 // SUPABASE (optional — for memory context)
@@ -317,12 +512,37 @@ const server = Bun.serve({
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
+    // Hospitable webhook — receives guest messages from Airbnb via Hospitable
+    if (url.pathname === "/hospitable-webhook" && req.method === "POST") {
+      try {
+        const payload = await req.json();
+        const eventType = payload.event || payload.type || "";
+        console.log(`Hospitable webhook received: ${eventType}`);
+
+        if (eventType === "message.created") {
+          // Process in background — don't block the webhook response
+          handleGuestWebhook(payload).catch((e) =>
+            console.error(`Hospitable webhook handler error: ${e.message}`)
+          );
+        }
+
+        return new Response(JSON.stringify({ status: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e: any) {
+        console.error(`Hospitable webhook parse error: ${e.message}`);
+        return new Response("Bad request", { status: 400 });
+      }
+    }
+
     // Health check
     if (url.pathname === "/health") {
       return new Response(
         JSON.stringify({
           status: "ok",
           activeCalls: activeSessions.size,
+          hospitable: isHospitableConfigured(),
           uptime: process.uptime(),
         }),
         { headers: { "Content-Type": "application/json" } }
@@ -515,6 +735,9 @@ console.log(`Call Server running on port ${PORT}`);
 if (ngrokUrl) {
   console.log(`ngrok URL detected: ${ngrokUrl}`);
   console.log(`WebSocket endpoint: ${ngrokUrl}/conversation`);
+  if (isHospitableConfigured()) {
+    console.log(`Hospitable webhook URL: ${ngrokUrl.replace("wss://", "https://")}/hospitable-webhook`);
+  }
 } else {
   console.log(
     "No ngrok URL detected. Start ngrok with: ngrok http " + PORT
