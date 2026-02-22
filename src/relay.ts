@@ -29,6 +29,12 @@ import {
   sendEmail,
   createDraft,
 } from "./ms365.ts";
+import {
+  handleHospitableRequest,
+  sendMessage as sendGuestMessage,
+  sendInquiryMessage,
+  syncTransactionsToSupabase,
+} from "./hospitable.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -295,6 +301,87 @@ function needsMs365(message: string): boolean {
   return ms365ActionPatterns.some(p => p.test(message));
 }
 
+// ============================================================
+// HOSPITABLE DETECTION & ACTION PROCESSING
+// ============================================================
+
+/**
+ * Check if a user message requires Hospitable (vacation rental) data.
+ */
+function needsHospitable(message: string): boolean {
+  if (process.env.HOSPITABLE_ENABLED !== "true") return false;
+
+  const hospitablePatterns = [
+    // Reservation / booking queries
+    /\b(reservat|booking|bookings|reserva[sç])\b/i,
+    // Guest-related
+    /\b(guests?|hóspede|hóspedes|check.?in|check.?out|arrivals?|departures?)\b/i,
+    // Property management
+    /\b(propert|listings?|my (apartment|house|villa|cabin|unit|place|rental))/i,
+    /\b(imóve[ils]|propriedad)/i,
+    // Platform references
+    /\b(airbnb|vrbo|booking\.com|hospitable)\b/i,
+    // Guest messaging & inbox
+    /\b(guest.?messag|write.?to.?guest|reply.?to.?guest|contact.?guest|message.?guest)\b/i,
+    /\b(mensagem.{0,10}hóspede|responder.{0,10}hóspede)\b/i,
+    /\b(hospitable.?inbox|inbox.?messages?|latest.?messages)\b/i,
+    /\b(caixa.?de.?entrada|mensagens?.?(recentes|novas|últimas))\b/i,
+    // Occupancy / availability
+    /\b(occupancy|availability|calendar.{0,10}(rental|property|listing)|vacant|blocked)\b/i,
+    /\b(ocupação|disponibilidade)\b/i,
+    // Reviews
+    /\b(reviews?|ratings?|avaliaç)/i,
+    // Stay types
+    /\b(stays?|night.?stay|upcoming.?stay)\b/i,
+    // Direct rental commands
+    /\b(rental|short.?term|vacation.?rental|aluguel)\b/i,
+    // Financial / earnings
+    /\b(earn|revenue|payout|transaction|financ|income|billing)\b/i,
+    /\b(fatur|ganhos?|receita|quanto.?(fiz|ganhei|faturei|recebi))\b/i,
+    /\b(how.?much.?(did|have|earn|made?))\b/i,
+    /\b(soma|sum|total).{0,15}(reserv|booking|month|mês|mes)/i,
+    /\b(relatório|report).{0,15}(financ|reserv|booking|mensal|monthly)/i,
+  ];
+
+  return hospitablePatterns.some(p => p.test(message));
+}
+
+/**
+ * Process Hospitable action tags in Claude's response.
+ * Claude can include these tags to trigger real actions:
+ *   [SEND_GUEST_MESSAGE: reservation_uuid | message body]
+ *   [SEND_INQUIRY_MESSAGE: inquiry_uuid | message body]
+ */
+async function processHospitableActions(response: string): Promise<string> {
+  let clean = response;
+
+  // [SEND_GUEST_MESSAGE: uuid | message] — for reservations
+  for (const match of response.matchAll(/\[SEND_GUEST_MESSAGE:\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+    try {
+      const result = await sendGuestMessage(match[1].trim(), match[2].trim());
+      console.log(`Sent guest message: ${result.sentReferenceId}`);
+      clean = clean.replace(match[0], `✅ Message sent to guest`);
+    } catch (error: any) {
+      console.error("Send guest message error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not send message: ${error.message}`);
+    }
+  }
+
+  // [SEND_INQUIRY_MESSAGE: uuid | message] — for inquiries (no reservation yet)
+  for (const match of response.matchAll(/\[SEND_INQUIRY_MESSAGE:\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+    try {
+      const result = await sendInquiryMessage(match[1].trim(), match[2].trim());
+      console.log(`Sent inquiry message: ${result.sentReferenceId}`);
+      clean = clean.replace(match[0], `✅ Message sent to inquiry guest`);
+    } catch (error: any) {
+      console.error("Send inquiry message error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not send inquiry message: ${error.message}`);
+    }
+  }
+
+  return clean;
+}
+
 /**
  * Process MS365 action tags in Claude's response.
  * Claude can include these tags to trigger real actions:
@@ -424,11 +511,21 @@ bot.on("message:text", async (ctx) => {
     console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
   }
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context);
+  // Check if we need Hospitable data (vacation rentals)
+  let hospitableContext = "";
+  if (needsHospitable(text)) {
+    console.log("Hospitable request detected, fetching data...");
+    hospitableContext = await handleHospitableRequest(text, recentHistory);
+    console.log(`Hospitable context: ${hospitableContext.substring(0, 100)}...`);
+  }
+
+  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext);
   const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
 
-  // Process MS365 action tags (create event, accept, send email, etc.)
-  const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
+  // Process action tags
+  let afterActions = rawResponse;
+  if (ms365Context) afterActions = await processMs365Actions(afterActions);
+  if (hospitableContext) afterActions = await processHospitableActions(afterActions);
 
   // Parse and save any memory intents, strip tags from response
   const response = await processMemoryIntents(supabase, afterActions);
@@ -480,15 +577,25 @@ bot.on("message:voice", async (ctx) => {
       ms365Context = await handleMs365Request(transcription, recentHistory);
     }
 
+    // Check if we need Hospitable data (vacation rentals)
+    let hospitableContext = "";
+    if (needsHospitable(transcription)) {
+      console.log("Hospitable request detected in voice, fetching data...");
+      hospitableContext = await handleHospitableRequest(transcription, recentHistory);
+    }
+
     const enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
       memoryContext,
       recentHistory,
-      ms365Context
+      ms365Context,
+      hospitableContext
     );
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
-    const afterActions = ms365Context ? await processMs365Actions(rawResponse) : rawResponse;
+    let afterActions = rawResponse;
+    if (ms365Context) afterActions = await processMs365Actions(afterActions);
+    if (hospitableContext) afterActions = await processHospitableActions(afterActions);
     const claudeResponse = await processMemoryIntents(supabase, afterActions);
 
     await saveMessage("assistant", claudeResponse);
@@ -605,7 +712,8 @@ function buildPrompt(
   relevantContext?: string,
   memoryContext?: string,
   recentHistory?: string,
-  ms365Context?: string
+  ms365Context?: string,
+  hospitableContext?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -649,6 +757,29 @@ function buildPrompt(
         "\nAlways CONFIRM with the user before sending emails or making calendar changes." +
         "\nFor drafts, you can save directly when the user asks — no confirmation needed since it doesn't send anything." +
         "\nSummarize emails concisely rather than showing raw data."
+    );
+  }
+
+  // Hospitable data (vacation rentals, reservations, guest messaging)
+  if (hospitableContext) {
+    parts.push(`\nHOSPITABLE DATA (Vacation Rentals):\n${hospitableContext}`);
+    parts.push(
+      "\nHOSPITABLE ACTIONS:" +
+        "\nWhen the user asks you to send a message to a guest, use the correct tag based on the type:" +
+        "\nFor RESERVATIONS: [SEND_GUEST_MESSAGE: reservation_uuid | message body text]" +
+        "\nFor INQUIRIES (no reservation yet): [SEND_INQUIRY_MESSAGE: inquiry_uuid | message body text]" +
+        "\n  Example: [SEND_GUEST_MESSAGE: 6f58fd0a-a9cb-3746-9219-384a156ff7bb | Hi! Your check-in is at 3pm.]" +
+        "\n  Example: [SEND_INQUIRY_MESSAGE: 90683af9-9dbd-4583-9a12-4f0b8dea3124 | Hi! Yes, those dates work perfectly.]" +
+        "\nThe UUID and type (reservation vs inquiry) are provided in the data above." +
+        "\nAlways CONFIRM with the user before sending messages to guests." +
+        "\n\nINBOX PRESENTATION STYLE:" +
+        "\nWhen the user asks for 'messages' or 'inbox', present the data as a clear summary:" +
+        "\n- Group by urgency: NEEDS YOUR ATTENTION first, then WAITING ON GUEST, then DEAD THREADS" +
+        "\n- For each conversation, show: guest name, property, status, dates, and the last few messages" +
+        "\n- Highlight who needs to respond (you or the guest)" +
+        "\n- Exclude currently-staying guests by default (unless the user asks about them)" +
+        "\n- Offer quick wins: suggest drafting replies for conversations waiting on a response from the host" +
+        "\nSummarize reservation data concisely. Group by property if multiple properties."
     );
   }
 
@@ -716,5 +847,17 @@ console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
 bot.start({
   onStart: () => {
     console.log("Bot is running!");
+    // Sync Hospitable financial data to Supabase on startup
+    if (process.env.HOSPITABLE_ENABLED === "true") {
+      syncTransactionsToSupabase()
+        .then((n) => n > 0 && console.log(`Synced ${n} Hospitable transactions to Supabase`))
+        .catch((e) => console.error("Hospitable sync failed:", e.message));
+      // Re-sync every 6 hours
+      setInterval(() => {
+        syncTransactionsToSupabase().catch((e) =>
+          console.error("Periodic Hospitable sync failed:", e.message)
+        );
+      }, 6 * 60 * 60 * 1000);
+    }
   },
 });

@@ -12,6 +12,12 @@
  * Run manually: bun run examples/morning-briefing.ts
  */
 
+import {
+  getFinancialsFromSupabase,
+  getReservations,
+  listProperties,
+} from "../src/hospitable";
+
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
 
@@ -83,6 +89,101 @@ async function getAINews(): Promise<string> {
   return "- OpenAI released GPT-5\n- Anthropic launches new feature";
 }
 
+async function getAirbnbSummary(): Promise<string> {
+  if (process.env.HOSPITABLE_ENABLED !== "true") return "";
+
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+
+  const startDate = new Date(year, month, 1).toISOString().split("T")[0];
+  const endDate = new Date(year, month + 1, 0).toISOString().split("T")[0];
+  const today = now.toISOString().split("T")[0];
+  const in7days = new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0];
+
+  const monthLabel = now.toLocaleDateString("en-US", { month: "long" });
+
+  // Fetch financials + upcoming reservations in parallel
+  const properties = await listProperties();
+  const propertyIds = properties.map((p) => p.id);
+
+  const [financials, upcoming] = await Promise.all([
+    getFinancialsFromSupabase(startDate, endDate),
+    getReservations({
+      propertyIds,
+      startDate: today,
+      endDate: in7days,
+      status: ["accepted"],
+      perPage: 20,
+    }),
+  ]);
+
+  const lines: string[] = [];
+
+  // Month-to-date earnings by property
+  if (financials.reservations.length) {
+    const byProperty: Record<string, { totalCents: number; currency: string; count: number }> = {};
+    for (const tx of financials.reservations) {
+      const prop = tx.property_name || "Unknown";
+      if (!byProperty[prop]) byProperty[prop] = { totalCents: 0, currency: tx.currency, count: 0 };
+      byProperty[prop].totalCents += tx.amount_cents;
+      byProperty[prop].count++;
+    }
+
+    lines.push(`*${monthLabel} Earnings (MTD):*`);
+    let grandTotal = 0;
+    for (const [prop, data] of Object.entries(byProperty)) {
+      const fmt = data.currency === "BRL"
+        ? `R$${(data.totalCents / 100).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}`
+        : `$${(data.totalCents / 100).toLocaleString("en-US", { minimumFractionDigits: 2 })}`;
+      lines.push(`  ${prop}: ${fmt} (${data.count} res)`);
+      grandTotal += data.totalCents;
+    }
+    if (Object.keys(byProperty).length > 1) {
+      const currency = financials.reservations[0]?.currency || "BRL";
+      const fmtGrand = currency === "BRL"
+        ? `R$${(grandTotal / 100).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}`
+        : `$${(grandTotal / 100).toLocaleString("en-US", { minimumFractionDigits: 2 })}`;
+      lines.push(`  *Total: ${fmtGrand}*`);
+    }
+  } else {
+    lines.push(`*${monthLabel} Earnings:* No data yet`);
+  }
+
+  // Payouts MTD
+  if (financials.payouts.length) {
+    let payoutTotal = 0;
+    for (const p of financials.payouts) payoutTotal += p.amount_cents;
+    const currency = financials.payouts[0]?.currency || "USD";
+    const fmtPayout = currency === "BRL"
+      ? `R$${(payoutTotal / 100).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}`
+      : `$${(payoutTotal / 100).toLocaleString("en-US", { minimumFractionDigits: 2 })}`;
+    lines.push(`*Payouts received:* ${fmtPayout} (${financials.payouts.length} transfers)`);
+  }
+
+  // Upcoming check-ins/outs (next 7 days)
+  if (upcoming.length) {
+    lines.push("");
+    lines.push("*Next 7 days:*");
+    for (const r of upcoming.sort(
+      (a, b) => new Date(a.arrivalDate).getTime() - new Date(b.arrivalDate).getTime()
+    )) {
+      const arrival = new Date(r.arrivalDate).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      const departure = new Date(r.departureDate).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      const isToday = r.arrivalDate.split("T")[0] === today;
+      const checkoutToday = r.departureDate.split("T")[0] === today;
+      let tag = "";
+      if (isToday) tag = " CHECK-IN TODAY";
+      else if (checkoutToday) tag = " CHECKOUT TODAY";
+      lines.push(`  ${arrival}–${departure}: ${r.guestName} @ ${r.propertyName} (${r.nights}n)${tag}`);
+    }
+  } else {
+    lines.push("\n*Next 7 days:* No upcoming reservations");
+  }
+
+  return lines.join("\n");
+}
+
 // ============================================================
 // BUILD BRIEFING
 // ============================================================
@@ -146,6 +247,16 @@ async function buildBriefing(): Promise<string> {
     }
   } catch (e) {
     console.error("News fetch failed:", e);
+  }
+
+  // Airbnb / Hospitable
+  try {
+    const airbnb = await getAirbnbSummary();
+    if (airbnb) {
+      sections.push(`🏠 **Airbnb**\n${airbnb}\n`);
+    }
+  } catch (e) {
+    console.error("Airbnb summary failed:", e);
   }
 
   // Footer
