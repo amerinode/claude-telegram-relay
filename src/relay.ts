@@ -36,6 +36,7 @@ import {
   sendInquiryMessage,
   syncTransactionsToSupabase,
 } from "./hospitable.ts";
+import { needsSearch, searchWeb } from "./search.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -209,21 +210,11 @@ async function callClaude(
   // Claude CLI detects piped stdin and runs in non-interactive mode automatically.
   const claudeArgs = ["--no-session-persistence", "--output-format", "text"];
 
-  // Allow web access tools based on configured search provider
-  // NOTE: WebSearch is excluded — it crashes Claude Code on Windows ARM64
-  const allowedTools = ["WebFetch"];
-  const searchProvider = process.env.SEARCH_PROVIDER || "brave";
-  if (searchProvider === "brave") {
-    allowedTools.push("mcp__brave-search__brave_web_search", "mcp__brave-search__brave_local_search");
-  } else if (searchProvider === "perplexity") {
-    allowedTools.push("mcp__perplexity__perplexity_search", "mcp__perplexity__perplexity_ask", "mcp__perplexity__perplexity_research", "mcp__perplexity__perplexity_reason");
-  }
-
-  // Pass as comma-separated string (CLI expects single value, not spread args)
-  claudeArgs.push("--allowedTools", allowedTools.join(","));
+  // Allow WebFetch for URL access. Web search is handled directly by the relay
+  // via Brave Search API (MCP approach crashes Bun on Windows ARM64).
+  claudeArgs.push("--allowedTools", "WebFetch");
 
   console.log(`Calling Claude (${prompt.length} chars): ${prompt.substring(0, 50)}...`);
-  console.log(`Allowed tools: ${allowedTools.join(", ")}`);
 
   try {
     // Strip Claude Code env vars to avoid nesting detection
@@ -248,6 +239,7 @@ async function callClaude(
         cwd: PROJECT_DIR || undefined,
         env: cleanEnv,
         stdio: ["pipe", "pipe", "pipe"],
+        shell: process.platform === "win32",
       });
 
       let output = "";
@@ -562,7 +554,15 @@ bot.on("message:text", async (ctx) => {
       console.log(`Hospitable context: ${hospitableContext.substring(0, 100)}...`);
     }
 
-    const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext);
+    // Check if we need web search results
+    let searchContext = "";
+    if (needsSearch(text)) {
+      console.log("Web search detected, querying Brave...");
+      searchContext = await searchWeb(text);
+      if (searchContext) console.log(`Search context: ${searchContext.substring(0, 100)}...`);
+    }
+
+    const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext, searchContext);
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
 
     // Process action tags
@@ -631,13 +631,21 @@ bot.on("message:voice", async (ctx) => {
       hospitableContext = await handleHospitableRequest(transcription, recentHistory);
     }
 
+    // Check if we need web search results
+    let searchContext = "";
+    if (needsSearch(transcription)) {
+      console.log("Web search detected in voice, querying Brave...");
+      searchContext = await searchWeb(transcription);
+    }
+
     const enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
       memoryContext,
       recentHistory,
       ms365Context,
-      hospitableContext
+      hospitableContext,
+      searchContext
     );
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
     let afterActions = rawResponse;
@@ -648,11 +656,15 @@ bot.on("message:voice", async (ctx) => {
     await saveMessage("assistant", claudeResponse);
 
     // TTS: reply with voice, matching the user's spoken language
+    console.log(`TTS: attempting synthesis, lang=${detectedLang}, response length=${claudeResponse.length}`);
     await ctx.replyWithChatAction("upload_voice");
     const audio = await synthesize(claudeResponse, detectedLang);
+    console.log(`TTS: result=${audio ? audio.length + ' bytes' : 'null'}`);
     if (audio) {
       await ctx.replyWithVoice(new InputFile(audio, "response.ogg"));
+      console.log("TTS: voice sent successfully");
     } else {
+      console.log("TTS: falling back to text");
       // Fallback to text if TTS fails
       await sendResponse(ctx, claudeResponse);
     }
@@ -760,7 +772,8 @@ function buildPrompt(
   memoryContext?: string,
   recentHistory?: string,
   ms365Context?: string,
-  hospitableContext?: string
+  hospitableContext?: string,
+  searchContext?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -827,6 +840,15 @@ function buildPrompt(
         "\n- Exclude currently-staying guests by default (unless the user asks about them)" +
         "\n- Offer quick wins: suggest drafting replies for conversations waiting on a response from the host" +
         "\nSummarize reservation data concisely. Group by property if multiple properties."
+    );
+  }
+
+  // Web search results (fetched directly by the relay)
+  if (searchContext) {
+    parts.push(`\n${searchContext}`);
+    parts.push(
+      "\nUse the search results above to answer the user's question with current information. " +
+        "Cite specific facts from the results. If the results don't fully answer the question, say so."
     );
   }
 
