@@ -15,6 +15,7 @@
     "setup:verify": "bun run setup/verify.ts"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.50",
     "@google-cloud/text-to-speech": "^6.4.0",
     "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^17.3.1",

@@ -186,6 +186,7 @@ export async function getReservations(options: {
   dateQuery?: "checkin" | "checkout";
   includeGuest?: boolean;
   perPage?: number;
+  sort?: string;
 } = {}): Promise<Reservation[]> {
   const params: Record<string, string> = {
     per_page: String(options.perPage || 20),
@@ -195,6 +196,7 @@ export async function getReservations(options: {
   if (options.startDate) params.start_date = options.startDate;
   if (options.endDate) params.end_date = options.endDate;
   if (options.dateQuery) params.date_query = options.dateQuery;
+  if (options.sort) params.sort = options.sort;
 
   // Build URL with array params manually (URLSearchParams doesn't handle arrays well)
   let url = "/v2/reservations";
@@ -354,6 +356,7 @@ export async function getInquiries(options: {
   propertyIds: string[];
   lastMessageAt?: string;
   perPage?: number;
+  sort?: string;
 }): Promise<Inquiry[]> {
   let url = "/v2/inquiries";
   const queryParts: string[] = [];
@@ -365,6 +368,9 @@ export async function getInquiries(options: {
   queryParts.push(`per_page=${options.perPage || 20}`);
   if (options.lastMessageAt) {
     queryParts.push(`last_message_at=${encodeURIComponent(options.lastMessageAt)}`);
+  }
+  if (options.sort) {
+    queryParts.push(`sort=${encodeURIComponent(options.sort)}`);
   }
 
   if (queryParts.length) url += "?" + queryParts.join("&");
@@ -433,13 +439,12 @@ export async function getMessages(reservationUuid: string): Promise<GuestMessage
 
 /**
  * Get messages for an inquiry (conversation with no reservation).
- * Uses the inquiries endpoint instead of reservations.
+ * NOTE: The Hospitable API v2 does not support reading inquiry messages
+ * (GET /v2/inquiries/{id}/messages returns 405). Only POST (sending) is supported.
+ * Return empty array to avoid spamming failed requests.
  */
-export async function getInquiryMessages(inquiryUuid: string): Promise<GuestMessage[]> {
-  const data = (await apiRequest(
-    `/v2/inquiries/${inquiryUuid}/messages`
-  )) as any;
-  return parseMessages(data);
+export async function getInquiryMessages(_inquiryUuid: string): Promise<GuestMessage[]> {
+  return [];
 }
 
 /**
@@ -741,29 +746,80 @@ export async function handleHospitableRequest(
           .join("\n");
     }
 
-    // Reservations — upcoming (default: next 30 days)
+    // Reservations — detect specific month or default to next 30 days
     if (
       msg.match(
         /\b(reservat|booking|check.?in|check.?out|guests?|hóspede|reserva|upcoming|arrivals?|departures?|stays?|ocupação|occupancy)\b/i
       ) ||
       !context
     ) {
-      const today = new Date().toISOString().split("T")[0];
-      const thirtyDays = new Date(Date.now() + 30 * 86400000)
-        .toISOString()
-        .split("T")[0];
+      // Detect specific month references (past or future)
+      const monthNames: Record<string, number> = {
+        jan: 0, janeiro: 0, january: 0,
+        fev: 1, fevereiro: 1, february: 1, feb: 1,
+        mar: 2, março: 2, march: 2,
+        abr: 3, abril: 3, april: 3, apr: 3,
+        mai: 4, maio: 4, may: 4,
+        jun: 5, junho: 5, june: 5,
+        jul: 6, julho: 6, july: 6,
+        ago: 7, agosto: 7, august: 7, aug: 7,
+        set: 8, setembro: 8, september: 8, sep: 8,
+        out: 9, outubro: 9, october: 9, oct: 9,
+        nov: 10, novembro: 10, november: 10,
+        dez: 11, dezembro: 11, december: 11, dec: 11,
+      };
+
+      const now = new Date();
+      const currentMonth = now.getMonth();
+      const currentYear = now.getFullYear();
+      let specificMonth: number | null = null;
+      let targetYear = currentYear;
+
+      for (const [name, idx] of Object.entries(monthNames)) {
+        if (msg.includes(name)) {
+          specificMonth = idx;
+          // If the month is in the future relative to current month, assume previous year
+          if (idx > currentMonth) targetYear = currentYear - 1;
+          break;
+        }
+      }
+
+      // Also detect "last month" / "mês passado"
+      if (msg.match(/\b(last.?month|mês.?passado|mes.?passado)\b/i)) {
+        specificMonth = currentMonth - 1;
+        if (specificMonth < 0) {
+          specificMonth = 11;
+          targetYear = currentYear - 1;
+        }
+      }
+
+      let startDate: string;
+      let endDate: string;
+      let periodLabel: string;
+
+      if (specificMonth !== null) {
+        // Specific month requested — fetch that entire month
+        startDate = new Date(targetYear, specificMonth, 1).toISOString().split("T")[0];
+        endDate = new Date(targetYear, specificMonth + 1, 0).toISOString().split("T")[0];
+        periodLabel = new Date(targetYear, specificMonth, 1).toLocaleDateString("en-US", { month: "long", year: "numeric" });
+      } else {
+        // Default: next 30 days
+        startDate = now.toISOString().split("T")[0];
+        endDate = new Date(Date.now() + 30 * 86400000).toISOString().split("T")[0];
+        periodLabel = "next 30 days";
+      }
 
       const reservations = await getReservations({
         propertyIds,
-        startDate: today,
-        endDate: thirtyDays,
+        startDate,
+        endDate,
         status: ["accepted", "request"],
-        perPage: 30,
+        perPage: 50,
       });
 
       if (reservations.length) {
         context +=
-          "\n\nUPCOMING RESERVATIONS (next 30 days):\n" +
+          `\n\nRESERVATIONS (${periodLabel}):\n` +
           reservations
             .map((r) => {
               const arrival = fmtDate(r.arrivalDate);
@@ -777,7 +833,7 @@ export async function handleHospitableRequest(
             })
             .join("\n");
       } else {
-        context += "\n\nUPCOMING RESERVATIONS: None in the next 30 days.";
+        context += `\n\nRESERVATIONS (${periodLabel}): None found.`;
       }
     }
 
@@ -793,14 +849,16 @@ export async function handleHospitableRequest(
       const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
 
       // Fetch inquiries AND reservations in parallel
+      // Use sort=-last_message_at to get conversations with most recent messages first
       const [inquiries, recentReservations] = await Promise.all([
-        getInquiries({ propertyIds, perPage: 15 }).catch((e: any) => {
+        getInquiries({ propertyIds, perPage: 30, sort: "-last_message_at" }).catch((e: any) => {
           console.error("Failed to fetch inquiries:", e.message);
           return [] as Inquiry[];
         }),
         getReservations({
           propertyIds,
-          perPage: 20,
+          perPage: 50,
+          sort: "-last_message_at",
         }).catch((e: any) => {
           console.error("Failed to fetch reservations for inbox:", e.message);
           return [] as Reservation[];
@@ -811,7 +869,13 @@ export async function handleHospitableRequest(
       const messageBlocks: { sortKey: string; block: string }[] = [];
 
       // Process inquiries (conversations with no reservation)
-      for (const inq of inquiries) {
+      // Sort by most recent message first (in case API doesn't honor sort param)
+      const sortedInquiries = [...inquiries].sort(
+        (a, b) =>
+          new Date(b.lastMessageAt || b.inquiryDate).getTime() -
+          new Date(a.lastMessageAt || a.inquiryDate).getTime()
+      );
+      for (const inq of sortedInquiries) {
         const dates = `${fmtDate(inq.arrivalDate)}–${fmtDate(inq.departureDate)}`;
         // For inquiries, the messages endpoint is the reservation messages format
         // but using the inquiry UUID
@@ -1143,6 +1207,44 @@ export async function handleHospitableRequest(
           "\n⚠️ NOTE: No financial/earnings data available for this period. " +
           "The reservation list above is complete but without monetary values. " +
           "You can manually add earnings data or check the Airbnb Earnings page.";
+      }
+    }
+
+    // Always include recent inquiries (pre-booking conversations) — these are
+    // guests without reservations who may need a response. Without this, the bot
+    // only sees reservations and misses inquiry-only conversations.
+    if (!context.includes("INQUIRY") && !context.includes("INBOX")) {
+      const recentInquiries = await getInquiries({
+        propertyIds,
+        perPage: 10,
+        sort: "-last_message_at",
+      }).catch(() => [] as Inquiry[]);
+
+      if (recentInquiries.length) {
+        // Fetch messages for the most recent inquiries
+        const inquiryBlocks: string[] = [];
+        const sorted = [...recentInquiries].sort(
+          (a, b) =>
+            new Date(b.lastMessageAt || b.inquiryDate).getTime() -
+            new Date(a.lastMessageAt || a.inquiryDate).getTime()
+        );
+        for (const inq of sorted.slice(0, 5)) {
+          const dates = `${fmtDate(inq.arrivalDate)}–${fmtDate(inq.departureDate)}`;
+          const block = await fetchMessageBlock(
+            inq.id,
+            inq.guestName,
+            inq.propertyName,
+            "inquiry",
+            dates,
+            inq.guestCount,
+            "inquiry"
+          );
+          if (block) inquiryBlocks.push(block);
+        }
+        if (inquiryBlocks.length) {
+          context += "\n\nRECENT INQUIRIES (guests without reservations):\n\n";
+          context += inquiryBlocks.join("\n\n");
+        }
       }
     }
 

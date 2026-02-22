@@ -9,6 +9,7 @@
 
 import { Bot, Context, InputFile } from "grammy";
 import { spawn } from "bun";
+import { spawn as nodeSpawn } from "node:child_process";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -204,11 +205,13 @@ async function callClaude(
   prompt: string,
   options?: { imagePath?: string; userMessage?: string }
 ): Promise<string> {
-  // Build the base Claude CLI arguments
-  const claudeArgs = ["-p", prompt, "--no-session-persistence", "--output-format", "text"];
+  // Build CLI args WITHOUT the prompt (prompt goes via stdin to avoid Windows arg length issues)
+  // Claude CLI detects piped stdin and runs in non-interactive mode automatically.
+  const claudeArgs = ["--no-session-persistence", "--output-format", "text"];
 
   // Allow web access tools based on configured search provider
-  const allowedTools = ["WebFetch", "WebSearch"];
+  // NOTE: WebSearch is excluded — it crashes Claude Code on Windows ARM64
+  const allowedTools = ["WebFetch"];
   const searchProvider = process.env.SEARCH_PROVIDER || "brave";
   if (searchProvider === "brave") {
     allowedTools.push("mcp__brave-search__brave_web_search", "mcp__brave-search__brave_local_search");
@@ -216,9 +219,10 @@ async function callClaude(
     allowedTools.push("mcp__perplexity__perplexity_search", "mcp__perplexity__perplexity_ask", "mcp__perplexity__perplexity_research", "mcp__perplexity__perplexity_reason");
   }
 
-  claudeArgs.push("--allowedTools", ...allowedTools);
+  // Pass as comma-separated string (CLI expects single value, not spread args)
+  claudeArgs.push("--allowedTools", allowedTools.join(","));
 
-  console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`Calling Claude (${prompt.length} chars): ${prompt.substring(0, 50)}...`);
   console.log(`Allowed tools: ${allowedTools.join(", ")}`);
 
   try {
@@ -227,35 +231,73 @@ async function callClaude(
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
 
-    const spawnArgs = [CLAUDE_PATH, ...claudeArgs];
+    // Write prompt to temp file, then pipe it via stdin.
+    // This avoids passing 17K+ as a command line argument which crashes Bun.spawn on Windows.
+    const promptFile = join(TEMP_DIR, `prompt_${Date.now()}.txt`);
+    await writeFile(promptFile, prompt);
 
-    const proc = spawn(spawnArgs, {
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: PROJECT_DIR || undefined,
-      env: cleanEnv,
+    return await new Promise<string>((resolve) => {
+      let resolved = false;
+      const safeResolve = (value: string) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(value);
+      };
+
+      const child = nodeSpawn(CLAUDE_PATH, claudeArgs, {
+        cwd: PROJECT_DIR || undefined,
+        env: cleanEnv,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      let output = "";
+      let stderr = "";
+      child.stdout?.on("data", (d: Buffer) => { output += d.toString(); });
+      child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+      // Kill after 3 minutes to prevent indefinite hanging
+      const timeout = setTimeout(() => {
+        console.error("Claude CLI timed out after 3 minutes");
+        child.kill("SIGTERM");
+        unlink(promptFile).catch(() => {});
+        safeResolve("Claude took too long to respond. Try a simpler question or try again.");
+      }, 180_000);
+
+      // Pipe the prompt file to stdin
+      const fs = require("fs");
+      const readStream = fs.createReadStream(promptFile);
+      readStream.pipe(child.stdin!);
+
+      child.on("close", (code: number | null) => {
+        clearTimeout(timeout);
+        unlink(promptFile).catch(() => {});
+
+        if (code !== 0) {
+          console.error(`Claude exit code: ${code}`);
+          console.error(`Claude stderr: ${stderr.substring(0, 500)}`);
+          safeResolve(`Error: ${stderr || "Claude exited with code " + code}`);
+          return;
+        }
+
+        const result = output.trim();
+        if (!result) {
+          console.error("Claude returned empty output");
+          console.error(`stderr: ${stderr}`);
+          safeResolve("Something went wrong — Claude returned no response. Try again in a moment.");
+          return;
+        }
+        safeResolve(result);
+      });
+
+      child.on("error", (err: Error) => {
+        clearTimeout(timeout);
+        unlink(promptFile).catch(() => {});
+        console.error("Spawn error:", err);
+        safeResolve("Error: Could not run Claude CLI");
+      });
     });
-
-    const output = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-
-    const exitCode = await proc.exited;
-
-    if (exitCode !== 0) {
-      console.error(`Claude exit code: ${exitCode}`);
-      console.error(`Claude stderr: ${stderr.substring(0, 500)}`);
-      return `Error: ${stderr || "Claude exited with code " + exitCode}`;
-    }
-
-    const result = output.trim();
-    if (!result) {
-      console.error("Claude returned empty output");
-      console.error(`stderr: ${stderr}`);
-      return "Something went wrong — Claude returned no response. Try again in a moment.";
-    }
-    return result;
   } catch (error) {
-    console.error("Spawn error:", error);
+    console.error("callClaude error:", error);
     return `Error: Could not run Claude CLI`;
   }
 }
@@ -492,46 +534,51 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
   console.log(`Message: ${text.substring(0, 50)}...`);
 
-  await ctx.replyWithChatAction("typing");
+  try {
+    await ctx.replyWithChatAction("typing");
 
-  await saveMessage("user", text);
+    await saveMessage("user", text);
 
-  // Gather context: recent history + semantic search + facts/goals
-  const [recentHistory, relevantContext, memoryContext] = await Promise.all([
-    getRecentHistory(supabase, 20),
-    getRelevantContext(supabase, text),
-    getMemoryContext(supabase),
-  ]);
+    // Gather context: recent history + semantic search + facts/goals
+    const [recentHistory, relevantContext, memoryContext] = await Promise.all([
+      getRecentHistory(supabase, 20),
+      getRelevantContext(supabase, text),
+      getMemoryContext(supabase),
+    ]);
 
-  // Check if we need MS365 data (email/calendar)
-  let ms365Context = "";
-  if (needsMs365(text)) {
-    console.log("MS365 request detected, fetching data via Graph API...");
-    ms365Context = await handleMs365Request(text, recentHistory);
-    console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
+    // Check if we need MS365 data (email/calendar)
+    let ms365Context = "";
+    if (needsMs365(text)) {
+      console.log("MS365 request detected, fetching data via Graph API...");
+      ms365Context = await handleMs365Request(text, recentHistory);
+      console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
+    }
+
+    // Check if we need Hospitable data (vacation rentals)
+    let hospitableContext = "";
+    if (needsHospitable(text)) {
+      console.log("Hospitable request detected, fetching data...");
+      hospitableContext = await handleHospitableRequest(text, recentHistory);
+      console.log(`Hospitable context: ${hospitableContext.substring(0, 100)}...`);
+    }
+
+    const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext);
+    const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
+
+    // Process action tags
+    let afterActions = rawResponse;
+    if (ms365Context) afterActions = await processMs365Actions(afterActions);
+    if (hospitableContext) afterActions = await processHospitableActions(afterActions);
+
+    // Parse and save any memory intents, strip tags from response
+    const response = await processMemoryIntents(supabase, afterActions);
+
+    await saveMessage("assistant", response);
+    await sendResponse(ctx, response);
+  } catch (error) {
+    console.error("Message handler error:", error);
+    await ctx.reply("Deu ruim processando sua mensagem. Tenta de novo.").catch(() => {});
   }
-
-  // Check if we need Hospitable data (vacation rentals)
-  let hospitableContext = "";
-  if (needsHospitable(text)) {
-    console.log("Hospitable request detected, fetching data...");
-    hospitableContext = await handleHospitableRequest(text, recentHistory);
-    console.log(`Hospitable context: ${hospitableContext.substring(0, 100)}...`);
-  }
-
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext);
-  const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
-
-  // Process action tags
-  let afterActions = rawResponse;
-  if (ms365Context) afterActions = await processMs365Actions(afterActions);
-  if (hospitableContext) afterActions = await processHospitableActions(afterActions);
-
-  // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, afterActions);
-
-  await saveMessage("assistant", response);
-  await sendResponse(ctx, response);
 });
 
 // Voice messages
@@ -840,11 +887,23 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 // START
 // ============================================================
 
+// Global error handlers
+bot.catch((err) => {
+  console.error("Grammy error:", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+
 console.log("Starting Claude Telegram Relay...");
 console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
 
 bot.start({
+  drop_pending_updates: true,
   onStart: () => {
     console.log("Bot is running!");
     // Sync Hospitable financial data to Supabase on startup
