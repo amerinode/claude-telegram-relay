@@ -1,6 +1,7 @@
 # Environment
 .env
 .env.local
+.mcp.json
 
 # Dependencies
 node_modules/

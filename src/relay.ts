@@ -241,7 +241,13 @@ async function callClaude(
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
-    return output.trim();
+    const result = output.trim();
+    if (!result) {
+      console.error("Claude returned empty output");
+      console.error(`stderr: ${stderr}`);
+      return "Something went wrong — Claude returned no response. Try again in a moment.";
+    }
+    return result;
   } catch (error) {
     console.error("Spawn error:", error);
     return `Error: Could not run Claude CLI`;
@@ -661,6 +667,11 @@ function buildPrompt(
 }
 
 async function sendResponse(ctx: Context, response: string): Promise<void> {
+  // Guard against empty responses (Telegram rejects empty messages)
+  if (!response || !response.trim()) {
+    response = "Something went wrong on my end. Try again in a sec!";
+  }
+
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
 
