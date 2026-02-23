@@ -10,8 +10,8 @@
 import { Bot, Context, InputFile } from "grammy";
 import { spawn } from "bun";
 import { spawn as nodeSpawn } from "node:child_process";
-import { writeFile, mkdir, readFile, unlink } from "fs/promises";
-import { join, dirname } from "path";
+import { writeFile, mkdir, readFile, readdir, unlink, stat } from "fs/promises";
+import { join, dirname, basename } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
 import { synthesize } from "./tts.ts";
@@ -37,6 +37,8 @@ import {
   syncTransactionsToSupabase,
 } from "./hospitable.ts";
 import { needsSearch, searchWeb } from "./search.ts";
+import { processFileActions } from "./file-gen.ts";
+import { makeCall, isCallConfigured } from "./call.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -53,6 +55,8 @@ const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claud
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
+const ONA_DIR = process.env.ONA_FOLDER || "";
+const FILES_DIR = ONA_DIR || join(PROJECT_ROOT, "files");
 
 // Session tracking for conversation continuity
 const SESSION_FILE = join(RELAY_DIR, "session.json");
@@ -145,6 +149,57 @@ if (!BOT_TOKEN) {
 // Create directories
 await mkdir(TEMP_DIR, { recursive: true });
 await mkdir(UPLOADS_DIR, { recursive: true });
+await mkdir(FILES_DIR, { recursive: true });
+
+// ============================================================
+// FILE OUTPUT DETECTION
+// ============================================================
+
+/** Get a snapshot of files in the output directory */
+async function snapshotFiles(): Promise<Map<string, number>> {
+  const snapshot = new Map<string, number>();
+  try {
+    const entries = await readdir(FILES_DIR);
+    for (const entry of entries) {
+      const filePath = join(FILES_DIR, entry);
+      const s = await stat(filePath);
+      if (s.isFile()) snapshot.set(filePath, s.mtimeMs);
+    }
+  } catch {}
+  return snapshot;
+}
+
+/** Find files created or modified since the snapshot */
+async function getNewFiles(before: Map<string, number>): Promise<string[]> {
+  const newFiles: string[] = [];
+  try {
+    const entries = await readdir(FILES_DIR);
+    for (const entry of entries) {
+      const filePath = join(FILES_DIR, entry);
+      const s = await stat(filePath);
+      if (!s.isFile()) continue;
+      const prevMtime = before.get(filePath);
+      if (prevMtime === undefined || s.mtimeMs > prevMtime) {
+        newFiles.push(filePath);
+      }
+    }
+  } catch {}
+  return newFiles;
+}
+
+/** Send files as Telegram documents */
+async function sendFiles(ctx: Context, files: string[]): Promise<void> {
+  for (const filePath of files) {
+    try {
+      const content = await readFile(filePath);
+      const name = basename(filePath);
+      console.log(`Sending file: ${name} (${content.length} bytes)`);
+      await ctx.replyWithDocument(new InputFile(content, name));
+    } catch (error) {
+      console.error(`Failed to send file ${filePath}:`, error);
+    }
+  }
+}
 
 // ============================================================
 // SUPABASE (optional — only if configured)
@@ -210,9 +265,10 @@ async function callClaude(
   // Claude CLI detects piped stdin and runs in non-interactive mode automatically.
   const claudeArgs = ["--no-session-persistence", "--output-format", "text"];
 
-  // Allow WebFetch for URL access. Web search is handled directly by the relay
-  // via Brave Search API (MCP approach crashes Bun on Windows ARM64).
-  claudeArgs.push("--allowedTools", "WebFetch");
+  // Allow WebFetch for URL access and Write for file creation.
+  // Web search is handled directly by the relay via Brave Search API
+  // (MCP approach crashes Bun on Windows ARM64).
+  claudeArgs.push("--allowedTools", "WebFetch,Write");
 
   console.log(`Calling Claude (${prompt.length} chars): ${prompt.substring(0, 50)}...`);
 
@@ -311,6 +367,9 @@ function needsMs365(message: string): boolean {
     /\b(show|read|check|fetch|list|open|get|find|search|send|forward|reply|delete|move|compose|draft|write)\b.{0,20}\b(emails?|e-mails?|mails?|inbox|messages?)\b/i,
     /\b(emails?|e-mails?|mails?|inbox)\b.{0,20}\b(from|to|today|this week|unread|latest|recent|new)\b/i,
     /\b(enviar|ler|buscar|mostrar|abrir|verificar|checar|mandar)\b.{0,20}\b(emails?|e-mails?)\b/i,
+    // Conversational Portuguese: "tenho email?", "algum email", "meus emails", "chegou email", "tem email"
+    /\b(tenho|tem|chegou|recebi|recebeu|algum|alguma|meus|minhas|novo|nova|importantes?)\b.{0,20}\b(emails?|e-mails?)\b/i,
+    /\b(emails?|e-mails?)\b.{0,20}\b(novo|nova|novos|novas|importantes?|pendentes?|hoje|recentes?|pra mim|para mim)\b/i,
     // Calendar actions: check, show, what's on, schedule, add, create, cancel
     /\b(show|check|what'?s on|list|open|get|add|create|schedule|cancel|remove|move|reschedule|book)\b.{0,20}\b(calendars?|schedule|agenda|meetings?|events?|appointments?|lunch|dinner|call)\b/i,
     /\b(add|create|schedule|book|set up|cancel|reschedule)\b.{0,30}\b(at|for|on|today|tomorrow|noon|morning|afternoon)\b/i,
@@ -417,6 +476,29 @@ async function processHospitableActions(response: string): Promise<string> {
 }
 
 /**
+ * Process phone call action tags in Claude's response.
+ * Claude includes: [MAKE_CALL: phone_number | message]
+ */
+async function processCallActions(response: string): Promise<string> {
+  let clean = response;
+
+  for (const match of response.matchAll(/\[MAKE_CALL:\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+    try {
+      const phone = match[1].trim();
+      const message = match[2].trim();
+      const sid = await makeCall(phone, message);
+      console.log(`Call initiated: ${phone} (SID: ${sid})`);
+      clean = clean.replace(match[0], `✅ Calling ${phone} now...`);
+    } catch (error: any) {
+      console.error("Make call error:", error.message);
+      clean = clean.replace(match[0], `❌ Could not make call: ${error.message}`);
+    }
+  }
+
+  return clean;
+}
+
+/**
  * Process MS365 action tags in Claude's response.
  * Claude can include these tags to trigger real actions:
  *   [CREATE_EVENT: subject | start_datetime | end_datetime | timezone]
@@ -482,8 +564,8 @@ async function processMs365Actions(response: string): Promise<string> {
     }
   }
 
-  // [SEND_EMAIL: to | subject | body]
-  for (const match of response.matchAll(/\[SEND_EMAIL:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+  // [SEND_EMAIL: to | subject | body]  ([\s\S]+? to match multiline bodies)
+  for (const match of response.matchAll(/\[SEND_EMAIL:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi)) {
     try {
       await sendEmail({
         to: [match[1].trim()],
@@ -498,8 +580,8 @@ async function processMs365Actions(response: string): Promise<string> {
     }
   }
 
-  // [CREATE_DRAFT: to | subject | body]
-  for (const match of response.matchAll(/\[CREATE_DRAFT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+  // [CREATE_DRAFT: to | subject | body]  ([\s\S]+? to match multiline bodies)
+  for (const match of response.matchAll(/\[CREATE_DRAFT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi)) {
     try {
       const result = await createDraft({
         to: [match[1].trim()],
@@ -563,18 +645,33 @@ bot.on("message:text", async (ctx) => {
     }
 
     const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext, searchContext);
+
+    // Snapshot files directory before Claude call
+    const filesBefore = await snapshotFiles();
+
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: text });
 
-    // Process action tags
+    // Process action tags (always run — Claude may emit tags from conversation history context)
     let afterActions = rawResponse;
-    if (ms365Context) afterActions = await processMs365Actions(afterActions);
-    if (hospitableContext) afterActions = await processHospitableActions(afterActions);
+    afterActions = await processMs365Actions(afterActions);
+    afterActions = await processHospitableActions(afterActions);
+    if (isCallConfigured()) afterActions = await processCallActions(afterActions);
+
+    // Process file creation action tags (Excel, PDF, PowerPoint)
+    const { clean: afterFiles, files: generatedFiles } = await processFileActions(afterActions);
 
     // Parse and save any memory intents, strip tags from response
-    const response = await processMemoryIntents(supabase, afterActions);
+    const response = await processMemoryIntents(supabase, afterFiles);
 
     await saveMessage("assistant", response);
     await sendResponse(ctx, response);
+
+    // Send files: generated via action tags + any files Claude wrote directly
+    const newFiles = await getNewFiles(filesBefore);
+    const allFiles = [...new Set([...generatedFiles, ...newFiles])];
+    if (allFiles.length > 0) {
+      await sendFiles(ctx, allFiles);
+    }
   } catch (error) {
     console.error("Message handler error:", error);
     await ctx.reply("Deu ruim processando sua mensagem. Tenta de novo.").catch(() => {});
@@ -649,8 +746,8 @@ bot.on("message:voice", async (ctx) => {
     );
     const rawResponse = await callClaude(enrichedPrompt, { userMessage: transcription });
     let afterActions = rawResponse;
-    if (ms365Context) afterActions = await processMs365Actions(afterActions);
-    if (hospitableContext) afterActions = await processHospitableActions(afterActions);
+    afterActions = await processMs365Actions(afterActions);
+    afterActions = await processHospitableActions(afterActions);
     const claudeResponse = await processMemoryIntents(supabase, afterActions);
 
     await saveMessage("assistant", claudeResponse);
@@ -853,6 +950,47 @@ function buildPrompt(
   }
 
   parts.push(
+    "\nFILE CREATION:" +
+      "\nWhen the user asks you to create a file, you have two methods:" +
+      "\n" +
+      "\nUse action tags to create files (processed automatically, never use the Write tool for files):" +
+      "\n" +
+      "\nEXCEL: [CREATE_EXCEL: filename.xlsx | Sheet Name | Header1 \\t Header2 \\n Row1Col1 \\t Row1Col2]" +
+      "\nPPTX:  [CREATE_PPTX: filename.pptx | Slide 1 Title | Slide 1 body ||| Slide 2 Title | Slide 2 body]" +
+      "\n" +
+      "\nHTML, DOCX, and PDF use BLOCK tags with closing markers (content can contain any characters):" +
+      "\n" +
+      "\n  [CREATE_HTML: filename.html]" +
+      "\n  <html>...full HTML content...</html>" +
+      "\n  [/CREATE_HTML]" +
+      "\n" +
+      "\n  [CREATE_DOCX: filename.docx]" +
+      "\n  # Title" +
+      "\n  ## Section" +
+      "\n  Paragraph text" +
+      "\n  - Bullet point" +
+      "\n  [/CREATE_DOCX]" +
+      "\n" +
+      "\n  [CREATE_PDF: filename.pdf]" +
+      "\n  # Title" +
+      "\n  Paragraph text" +
+      "\n  - Bullet point" +
+      "\n  [/CREATE_PDF]" +
+      "\n" +
+      "\nFor Excel: separate columns with \\t (tab), rows with \\n (newline). First row = headers." +
+      "\nFor HTML: write complete, well-styled HTML with inline CSS. Make it visually polished." +
+      "\nFor Word (.docx): use markdown formatting (# headings, ## subheadings, **bold**, *italic*, - bullets, numbered lists, | pipe tables |)." +
+      "\nFor PDF: use markdown-like formatting (# headings, - bullets, numbered lists)." +
+      "\nFor PowerPoint: separate slides with |||, separate title from body with |." +
+      "\nIMPORTANT: When the user asks for 'Word', 'documento', 'Word document', or 'docx' → use CREATE_DOCX (not PDF)." +
+      "\nIMPORTANT: HTML, DOCX, and PDF MUST use block format with [/CREATE_HTML], [/CREATE_DOCX], or [/CREATE_PDF] closing tags." +
+      "\n" +
+      "\nAll files are automatically sent to the user via Telegram AND saved to the Ona folder." +
+      "\nCRITICAL: When creating files, the document content must ONLY appear inside the action tag. Do NOT repeat or preview the content as plain text in your response. Your response should contain ONLY the action tag plus a SHORT confirmation (1-3 sentences) of what you created. The user will receive the file directly — they do not need to see the content in chat." +
+      "\nPrefer the format the user requests (e.g., 'em Word' → DOCX, 'documento' → DOCX, 'planilha' → Excel, 'apresentação' → PPTX)."
+  );
+
+  parts.push(
     "\nMEMORY MANAGEMENT:" +
       "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
       "include these tags in your response (they are processed automatically and hidden from the user):" +
@@ -860,6 +998,29 @@ function buildPrompt(
       "\n[GOAL: goal text | DEADLINE: optional date]" +
       "\n[DONE: search text for completed goal]"
   );
+
+  // Phone calling via Twilio
+  if (isCallConfigured()) {
+    const phoneUS = process.env.USER_PHONE_US || "";
+    const phoneBR = process.env.USER_PHONE_BR || "";
+    parts.push(
+      "\nPHONE CALLS:" +
+        "\nYou can call the user via Twilio. Use this action tag:" +
+        "\n[MAKE_CALL: phone_number | greeting message]" +
+        "\n" +
+        `\n${USER_NAME}'s phone numbers:` +
+        `\n  US mobile: ${phoneUS}` +
+        `\n  Brazil mobile: ${phoneBR}` +
+        "\n" +
+        "\nRules:" +
+        "\n- \"Call me\", \"call me\" → call US number, greet in English" +
+        "\n- \"Me liga\", \"me chama\" → call US number, greet in Portuguese" +
+        "\n- \"Call me in Brazil\", \"me chama no Brasil\", \"me liga no Brasil\" → call Brazil number, greet in corresponding language" +
+        "\n- The greeting message should be brief and natural (e.g., \"Hey Gil, you asked me to call!\")" +
+        "\n- Match the greeting language to the user's request language" +
+        "\n- Do NOT ask for confirmation — just make the call immediately when requested"
+    );
+  }
 
   parts.push(`\nUser: ${userMessage}`);
 

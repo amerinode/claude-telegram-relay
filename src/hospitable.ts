@@ -1266,3 +1266,51 @@ export async function handleHospitableRequest(
     return `HOSPITABLE ERROR: ${error.message}`;
   }
 }
+
+// ============================================================
+// WEBHOOK HELPERS (used by call-server.ts)
+// ============================================================
+
+/**
+ * Check if Hospitable is configured.
+ */
+export function isHospitableConfigured(): boolean {
+  return !!(process.env.HOSPITABLE_ENABLED === "true" && API_TOKEN);
+}
+
+/**
+ * List recent messages for a reservation (wrapper around getMessages).
+ */
+export async function listMessages(
+  reservationUuid: string,
+  limit?: number
+): Promise<GuestMessage[]> {
+  const messages = await getMessages(reservationUuid);
+  return limit ? messages.slice(-limit) : messages;
+}
+
+/**
+ * Parse a Hospitable webhook payload into a structured format.
+ */
+export function formatWebhookMessage(payload: any): {
+  guestName: string;
+  propertyName: string;
+  messageBody: string;
+  reservationId: string;
+  arrivalDate: string;
+  departureDate: string;
+  platform: string;
+} | null {
+  const data = payload.data || payload;
+  if (!data) return null;
+
+  const guestName = data.guest?.first_name || data.guest_name || data.guest?.name || "Guest";
+  const propertyName = data.properties?.[0]?.name || data.property_name || data.property?.name || "Property";
+  const messageBody = data.body || data.message?.body || data.content || "";
+  const reservationId = data.reservation_uuid || data.reservation_id || data.reservation?.uuid || "";
+  const arrivalDate = (data.arrival_date || "").split("T")[0];
+  const departureDate = (data.departure_date || "").split("T")[0];
+  const platform = data.platform || "airbnb";
+
+  return { guestName, propertyName, messageBody, reservationId, arrivalDate, departureDate, platform };
+}

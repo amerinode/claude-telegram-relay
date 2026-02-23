@@ -12,7 +12,7 @@
 import { readFile, writeFile } from "fs/promises";
 import { join } from "path";
 
-const CLIENT_ID = process.env.MS365_MCP_CLIENT_ID || "4e867585-b915-4309-8683-7e5b2df4513c";
+const CLIENT_ID = process.env.MS365_MCP_CLIENT_ID || "084a3e9f-a9f4-43f7-89f9-d229cf97853e";
 const TENANT_ID = process.env.MS365_MCP_TENANT_ID || "c5076972-58d0-45f3-bc1c-25cd8d4821ed";
 const TOKEN_CACHE_PATH = process.env.MS365_TOKEN_CACHE_PATH ||
   join(process.env.USERPROFILE || process.env.HOME || "~", ".ms365-tokens", ".token-cache.json");
@@ -376,16 +376,23 @@ export async function handleMs365Request(userMessage: string, recentHistory: str
     let context = "";
 
     // Fetch relevant data
-    if (msg.match(/\b(calendars?|schedule|meetings?|events?|agenda|appointments?|what'?s on)\b/i)) {
-      const events = await listCalendarEvents();
+    if (msg.match(/\b(calendars?|calend[aá]rios?|schedule|meetings?|events?|agenda|appointments?|what'?s on|compromissos?|reuni[aãõo])/i)) {
+      // Determine date range: today or tomorrow?
+      const isTomorrow = /\b(tomorrow)\b|amanh[aã]/i.test(msg);
+      const now = new Date();
+      const targetDate = isTomorrow ? new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1) : now;
+      const start = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate()).toISOString();
+      const end = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate() + 1).toISOString();
+      const dayLabel = isTomorrow ? "TOMORROW'S" : "TODAY'S";
+      const events = await listCalendarEvents(start, end);
       if (events.length) {
-        context += "TODAY'S CALENDAR:\n" + events.map(e => {
+        context += `${dayLabel} CALENDAR:\n` + events.map(e => {
           const start = new Date(e.start).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
           const end = new Date(e.end).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
           return `- ${start}-${end}: ${e.subject} (organizer: ${e.organizer}, status: ${e.status})${e.isOnline ? " [Teams]" : ""}`;
         }).join("\n");
       } else {
-        context += "TODAY'S CALENDAR: No events found.";
+        context += `${dayLabel} CALENDAR: No events found.`;
       }
     }
 
