@@ -17,6 +17,7 @@
   "dependencies": {
     "@anthropic-ai/claude-code": "^2.1.50",
     "@google-cloud/text-to-speech": "^6.4.0",
+    "@hapi/boom": "^10.0.1",
     "@supabase/supabase-js": "^2.45.0",
     "docx": "^9.5.3",
     "dotenv": "^17.3.1",
@@ -25,9 +26,10 @@
     "groq-sdk": "^0.37.0",
     "pdfkit": "^0.17.2",
     "pptxgenjs": "^4.0.1",
-    "twilio": "^5.12.2"
+    "twilio": "^5.12.2",
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "tsx": "^4.21.0"
   }
 }

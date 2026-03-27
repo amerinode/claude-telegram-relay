@@ -10,7 +10,8 @@
  */
 
 import { readFile, writeFile } from "fs/promises";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
 const CLIENT_ID = process.env.MS365_MCP_CLIENT_ID || "084a3e9f-a9f4-43f7-89f9-d229cf97853e";
 const TENANT_ID = process.env.MS365_MCP_TENANT_ID || "c5076972-58d0-45f3-bc1c-25cd8d4821ed";
@@ -44,7 +45,7 @@ async function refreshAccessToken(): Promise<string> {
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
-    scope: "Mail.ReadWrite Mail.Send Calendars.ReadWrite OnlineMeetingTranscript.Read.All User.Read offline_access",
+    scope: "Mail.ReadWrite Mail.Send Calendars.ReadWrite Tasks.ReadWrite User.Read offline_access",
   });
 
   const resp = await fetch(TOKEN_URL, {
@@ -138,6 +139,21 @@ async function graphRequest(
   return resp.json();
 }
 
+/**
+ * Load the email whitelist from config/email-whitelist.json.
+ * Returns lowercased email addresses that should never be flagged as spam.
+ */
+async function loadEmailWhitelist(): Promise<string[]> {
+  try {
+    const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = await readFile(join(projectRoot, "config", "email-whitelist.json"), "utf-8");
+    const data = JSON.parse(raw);
+    return (data.whitelist || []).map((e: string) => e.toLowerCase().trim());
+  } catch {
+    return [];
+  }
+}
+
 // ============================================================
 // PUBLIC API — Called by the relay
 // ============================================================
@@ -146,6 +162,7 @@ export interface Email {
   id: string;
   subject: string;
   from: string;
+  fromEmail: string;
   receivedAt: string;
   preview: string;
   isRead: boolean;
@@ -161,6 +178,105 @@ export interface CalendarEvent {
   status: string;
   isOnline: boolean;
   onlineUrl?: string;
+}
+
+export interface TodoTaskList {
+  id: string;
+  displayName: string;
+}
+
+export interface TodoTask {
+  id: string;
+  listId: string;
+  listName: string;
+  title: string;
+  body: string;
+  importance: string;
+  status: string;
+  dueDateTime: string | null;
+  createdDateTime: string;
+}
+
+/**
+ * List all To Do task lists.
+ */
+export async function listTaskLists(): Promise<TodoTaskList[]> {
+  const data = await graphRequest("/me/todo/lists", {
+    params: { $top: "50" },
+  }) as { value: any[] };
+
+  return (data.value || []).map((l: any) => ({
+    id: l.id,
+    displayName: l.displayName || "(untitled)",
+  }));
+}
+
+/**
+ * List tasks in a specific To Do list.
+ */
+export async function listTasks(
+  listId: string,
+  listName: string,
+  filter?: string
+): Promise<TodoTask[]> {
+  const params: Record<string, string> = {
+    $top: "100",
+  };
+
+  const data = await graphRequest(`/me/todo/lists/${listId}/tasks`, {
+    params,
+  }) as { value: any[] };
+
+  let tasks = (data.value || []).map((t: any) => ({
+    id: t.id,
+    listId,
+    listName,
+    title: t.title || "(untitled)",
+    body: t.body?.content || "",
+    importance: t.importance || "normal",
+    status: t.status || "notStarted",
+    dueDateTime: t.dueDateTime?.dateTime || null,
+    createdDateTime: t.createdDateTime || "",
+  }));
+
+  // Filter in code — Graph API $filter on To Do tasks is unreliable
+  if (filter === "status ne 'completed'") {
+    tasks = tasks.filter(t => t.status !== "completed");
+  }
+
+  // Sort: high importance first
+  tasks.sort((a, b) => {
+    const order: Record<string, number> = { high: 0, normal: 1, low: 2 };
+    return (order[a.importance] ?? 1) - (order[b.importance] ?? 1);
+  });
+
+  return tasks;
+}
+
+/**
+ * Update a To Do task (e.g. mark complete).
+ */
+export async function updateTask(
+  listId: string,
+  taskId: string,
+  updates: Record<string, unknown>
+): Promise<void> {
+  await graphRequest(`/me/todo/lists/${listId}/tasks/${taskId}`, {
+    method: "PATCH",
+    body: updates,
+  });
+}
+
+/**
+ * Find a task list by display name (case-insensitive).
+ */
+export async function findTaskList(name: string): Promise<TodoTaskList | null> {
+  const lists = await listTaskLists();
+  const lower = name.toLowerCase().replace(/[^\w\s]/g, "").trim();
+  return lists.find((l) => {
+    const listName = l.displayName.toLowerCase().replace(/[^\w\s]/g, "").trim();
+    return listName === lower || listName.includes(lower) || lower.includes(listName);
+  }) || null;
 }
 
 /**
@@ -179,6 +295,7 @@ export async function listEmails(count: number = 10): Promise<Email[]> {
     id: m.id,
     subject: m.subject || "(no subject)",
     from: m.from?.emailAddress?.name || m.from?.emailAddress?.address || "unknown",
+    fromEmail: m.from?.emailAddress?.address || "",
     receivedAt: m.receivedDateTime,
     preview: m.bodyPreview?.substring(0, 200) || "",
     isRead: m.isRead,
@@ -188,7 +305,7 @@ export async function listEmails(count: number = 10): Promise<Email[]> {
 /**
  * Read a specific email by ID.
  */
-export async function readEmail(messageId: string): Promise<{ subject: string; from: string; body: string; receivedAt: string }> {
+export async function readEmail(messageId: string): Promise<{ subject: string; from: string; fromEmail: string; body: string; receivedAt: string }> {
   const m = await graphRequest(`/me/messages/${messageId}`, {
     params: { $select: "subject,from,body,receivedDateTime" },
   }) as any;
@@ -196,6 +313,7 @@ export async function readEmail(messageId: string): Promise<{ subject: string; f
   return {
     subject: m.subject || "(no subject)",
     from: m.from?.emailAddress?.name || m.from?.emailAddress?.address || "unknown",
+    fromEmail: m.from?.emailAddress?.address || "",
     body: m.body?.content || "",
     receivedAt: m.receivedDateTime,
   };
@@ -217,6 +335,7 @@ export async function searchEmails(query: string, count: number = 5): Promise<Em
     id: m.id,
     subject: m.subject || "(no subject)",
     from: m.from?.emailAddress?.name || m.from?.emailAddress?.address || "unknown",
+    fromEmail: m.from?.emailAddress?.address || "",
     receivedAt: m.receivedDateTime,
     preview: m.bodyPreview?.substring(0, 200) || "",
     isRead: m.isRead,
@@ -263,231 +382,6 @@ export async function listCalendarEvents(
   }));
 }
 
-// ============================================================
-// TEAMS MEETING TRANSCRIPTS
-// ============================================================
-
-interface TranscriptInfo {
-  id: string;
-  meetingId: string;
-  createdDateTime: string;
-}
-
-/**
- * Find the online meeting ID by join URL.
- * Calendar events have a joinUrl; the transcript API needs the meeting ID.
- */
-async function getOnlineMeetingByJoinUrl(joinUrl: string): Promise<string | null> {
-  try {
-    const data = await graphRequest("/me/onlineMeetings", {
-      params: {
-        $filter: `JoinWebUrl eq '${joinUrl}'`,
-        $select: "id",
-      },
-    }) as { value: any[] };
-    return data.value?.[0]?.id || null;
-  } catch (e: any) {
-    console.error("Failed to find online meeting:", e.message);
-    return null;
-  }
-}
-
-/**
- * List transcripts for an online meeting.
- */
-async function listMeetingTranscripts(onlineMeetingId: string): Promise<TranscriptInfo[]> {
-  const data = await graphRequest(
-    `/me/onlineMeetings/${onlineMeetingId}/transcripts`,
-    { params: { $select: "id,meetingId,createdDateTime" } }
-  ) as { value: any[] };
-
-  return (data.value || []).map((t: any) => ({
-    id: t.id,
-    meetingId: t.meetingId,
-    createdDateTime: t.createdDateTime,
-  }));
-}
-
-/**
- * Get transcript content as VTT text and parse it into readable format.
- */
-async function getTranscriptContent(onlineMeetingId: string, transcriptId: string): Promise<string> {
-  const token = await getAccessToken();
-  const url = `${GRAPH_BASE}/me/onlineMeetings/${onlineMeetingId}/transcripts/${transcriptId}/content?$format=text/vtt`;
-
-  const resp = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "text/vtt",
-    },
-  });
-
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Transcript fetch failed (${resp.status}): ${err.substring(0, 300)}`);
-  }
-
-  return resp.text();
-}
-
-/**
- * Parse VTT transcript into readable speaker/text format.
- * VTT format:
- *   WEBVTT
- *   00:00:00.000 --> 00:00:05.000
- *   <v Speaker Name>Some text here</v>
- */
-function parseVtt(vtt: string): Array<{ speaker: string; text: string; time: string }> {
-  const entries: Array<{ speaker: string; text: string; time: string }> = [];
-  const lines = vtt.split("\n");
-
-  let currentTime = "";
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    // Timestamp line: 00:00:00.000 --> 00:00:05.000
-    const timeMatch = trimmed.match(/^(\d{2}:\d{2}:\d{2})\.\d+ -->/);
-    if (timeMatch) {
-      currentTime = timeMatch[1];
-      continue;
-    }
-
-    // Speaker line: <v Speaker Name>text</v>
-    const speakerMatch = trimmed.match(/^<v\s+([^>]+)>(.+?)(?:<\/v>)?$/);
-    if (speakerMatch) {
-      entries.push({
-        speaker: speakerMatch[1].trim(),
-        text: speakerMatch[2].trim(),
-        time: currentTime,
-      });
-      continue;
-    }
-
-    // Plain text line (no speaker tag, but has content after a timestamp)
-    if (trimmed && currentTime && !trimmed.startsWith("WEBVTT") && !trimmed.startsWith("NOTE")) {
-      const lastEntry = entries[entries.length - 1];
-      if (lastEntry && lastEntry.time === currentTime) {
-        lastEntry.text += " " + trimmed;
-      } else if (trimmed.length > 1) {
-        entries.push({ speaker: "Unknown", text: trimmed, time: currentTime });
-      }
-    }
-  }
-
-  return entries;
-}
-
-/**
- * Fetch transcript for a Teams meeting, given the calendar event's join URL.
- * Returns formatted transcript text or null if no transcript available.
- */
-export async function getMeetingTranscript(joinUrl: string, subject: string): Promise<string | null> {
-  try {
-    const meetingId = await getOnlineMeetingByJoinUrl(joinUrl);
-    if (!meetingId) {
-      console.log(`No online meeting found for: ${subject}`);
-      return null;
-    }
-
-    const transcripts = await listMeetingTranscripts(meetingId);
-    if (!transcripts.length) {
-      console.log(`No transcripts for meeting: ${subject}`);
-      return null;
-    }
-
-    // Get the most recent transcript
-    const latest = transcripts[transcripts.length - 1];
-    const vttContent = await getTranscriptContent(meetingId, latest.id);
-    const parsed = parseVtt(vttContent);
-
-    if (!parsed.length) return null;
-
-    // Format: consolidate consecutive lines from same speaker
-    const consolidated: Array<{ speaker: string; text: string; time: string }> = [];
-    for (const entry of parsed) {
-      const last = consolidated[consolidated.length - 1];
-      if (last && last.speaker === entry.speaker) {
-        last.text += " " + entry.text;
-      } else {
-        consolidated.push({ ...entry });
-      }
-    }
-
-    // Limit to avoid blowing up context
-    const maxEntries = 60;
-    const limited = consolidated.slice(0, maxEntries);
-    const lines = limited.map(e => `[${e.time}] ${e.speaker}: ${e.text}`);
-    if (consolidated.length > maxEntries) {
-      lines.push(`... (${consolidated.length - maxEntries} more entries truncated)`);
-    }
-
-    return lines.join("\n");
-  } catch (error: any) {
-    console.error(`Transcript error for "${subject}":`, error.message);
-    return null;
-  }
-}
-
-/**
- * Fetch transcripts for recent Teams meetings.
- * Gets calendar events, finds ones with Teams, fetches their transcripts.
- */
-export async function getRecentMeetingTranscripts(
-  startDate?: string,
-  endDate?: string,
-  targetSubject?: string
-): Promise<string> {
-  const events = await listCalendarEvents(startDate, endDate, 20);
-  const teamsEvents = events.filter(e => e.isOnline && e.onlineUrl);
-
-  if (!teamsEvents.length) return "No Teams meetings found for this period.";
-
-  // If asking about a specific meeting, find it
-  if (targetSubject) {
-    const target = targetSubject.toLowerCase();
-    const match = teamsEvents.find(e =>
-      e.subject.toLowerCase().includes(target) ||
-      target.split(/\s+/).filter(w => w.length > 3).some(w => e.subject.toLowerCase().includes(w))
-    );
-    if (match && match.onlineUrl) {
-      const transcript = await getMeetingTranscript(match.onlineUrl, match.subject);
-      if (transcript) {
-        const time = new Date(match.start).toLocaleString("en-US", {
-          timeZone: process.env.USER_TIMEZONE || "America/Sao_Paulo",
-          weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-        });
-        return `MEETING TRANSCRIPT: ${match.subject} (${time})\nOrganizer: ${match.organizer}\n\n${transcript}`;
-      }
-      return `Meeting "${match.subject}" found but no transcript available. Transcription may not have been enabled for this meeting.`;
-    }
-  }
-
-  // List meetings with transcript availability
-  const results: string[] = [];
-  results.push(`TEAMS MEETINGS (${teamsEvents.length}):\n`);
-
-  for (const event of teamsEvents.slice(0, 5)) {
-    const time = new Date(event.start).toLocaleString("en-US", {
-      timeZone: process.env.USER_TIMEZONE || "America/Sao_Paulo",
-      weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-    });
-
-    let transcriptStatus = "";
-    if (event.onlineUrl) {
-      const meetingId = await getOnlineMeetingByJoinUrl(event.onlineUrl);
-      if (meetingId) {
-        const transcripts = await listMeetingTranscripts(meetingId);
-        transcriptStatus = transcripts.length > 0 ? " [TRANSCRIPT AVAILABLE]" : " [no transcript]";
-      }
-    }
-
-    results.push(`- ${time}: ${event.subject} (${event.organizer})${transcriptStatus}`);
-  }
-
-  results.push("\nAsk about a specific meeting to see its full transcript.");
-  return results.join("\n");
-}
-
 /**
  * Create a calendar event.
  */
@@ -523,6 +417,42 @@ export async function createCalendarEvent(params: {
   }) as any;
 
   return { id: result.id, subject: result.subject };
+}
+
+/**
+ * Update a calendar event (reschedule, rename, change location, etc.).
+ */
+export async function updateCalendarEvent(
+  eventId: string,
+  updates: {
+    subject?: string;
+    startDateTime?: string;
+    endDateTime?: string;
+    timeZone?: string;
+    location?: string;
+  }
+): Promise<{ id: string; subject: string }> {
+  const tz = updates.timeZone || process.env.USER_TIMEZONE || "America/New_York";
+  const body: any = {};
+
+  if (updates.subject) body.subject = updates.subject;
+  if (updates.startDateTime) body.start = { dateTime: updates.startDateTime, timeZone: tz };
+  if (updates.endDateTime) body.end = { dateTime: updates.endDateTime, timeZone: tz };
+  if (updates.location) body.location = { displayName: updates.location };
+
+  const result = await graphRequest(`/me/events/${eventId}`, {
+    method: "PATCH",
+    body,
+  }) as any;
+
+  return { id: result.id, subject: result.subject };
+}
+
+/**
+ * Delete a calendar event.
+ */
+export async function deleteCalendarEvent(eventId: string): Promise<void> {
+  await graphRequest(`/me/events/${eventId}`, { method: "DELETE" });
 }
 
 /**
@@ -591,6 +521,88 @@ export async function createDraft(params: {
 }
 
 /**
+ * Create a mail folder under Inbox (or another parent folder).
+ */
+export async function createMailFolder(
+  displayName: string,
+  parentFolderId?: string
+): Promise<{ id: string; displayName: string }> {
+  const path = parentFolderId
+    ? `/me/mailFolders/${parentFolderId}/childFolders`
+    : "/me/mailFolders/Inbox/childFolders";
+
+  const result = await graphRequest(path, {
+    method: "POST",
+    body: { displayName },
+  }) as any;
+
+  return { id: result.id, displayName: result.displayName };
+}
+
+/**
+ * Find a mail folder by display name (searches Inbox children).
+ */
+export async function findMailFolder(name: string): Promise<{ id: string; displayName: string } | null> {
+  const data = await graphRequest("/me/mailFolders/Inbox/childFolders", {
+    params: { $top: "100" },
+  }) as { value: any[] };
+
+  const lower = name.toLowerCase().trim();
+  const found = (data.value || []).find((f: any) =>
+    (f.displayName || "").toLowerCase().trim() === lower
+  );
+  return found ? { id: found.id, displayName: found.displayName } : null;
+}
+
+/**
+ * Move an email to a different folder.
+ */
+export async function moveEmail(
+  messageId: string,
+  destinationFolderId: string
+): Promise<{ id: string }> {
+  const result = await graphRequest(`/me/messages/${messageId}/move`, {
+    method: "POST",
+    body: { destinationId: destinationFolderId },
+  }) as any;
+
+  return { id: result.id };
+}
+
+/**
+ * Create a mail folder if it doesn't exist, return the folder ID either way.
+ */
+export async function getOrCreateMailFolder(name: string): Promise<{ id: string; displayName: string; created: boolean }> {
+  const existing = await findMailFolder(name);
+  if (existing) return { ...existing, created: false };
+  const created = await createMailFolder(name);
+  return { ...created, created: true };
+}
+
+/**
+ * Create a task in a To Do list.
+ */
+export async function createTask(
+  listId: string,
+  title: string,
+  body?: string,
+  dueDateTime?: string,
+  importance?: string
+): Promise<{ id: string; title: string }> {
+  const taskBody: any = { title };
+  if (body) taskBody.body = { contentType: "Text", content: body };
+  if (dueDateTime) taskBody.dueDateTime = { dateTime: dueDateTime, timeZone: "UTC" };
+  if (importance) taskBody.importance = importance;
+
+  const result = await graphRequest(`/me/todo/lists/${listId}/tasks`, {
+    method: "POST",
+    body: taskBody,
+  }) as any;
+
+  return { id: result.id, title: result.title };
+}
+
+/**
  * Process a natural language MS365 request using Claude.
  * Claude gets the available functions and figures out which to call.
  */
@@ -599,44 +611,6 @@ export async function handleMs365Request(userMessage: string, recentHistory: str
     // First, gather context based on what the user seems to want
     const msg = userMessage.toLowerCase();
     let context = "";
-
-    // Meeting transcripts — check before general calendar to handle transcript-specific requests
-    if (msg.match(/\b(transcript|transcrição|transcription|transcri[çc])/i) ||
-        (msg.match(/\b(what|o que).{0,15}(was|were|foi|foram).{0,15}(discussed|decided|said|talked|falado|decidido|discutido)\b/i)) ||
-        (msg.match(/\b(who|quem).{0,15}(said|falou|disse)\b/i)) ||
-        (msg.match(/\b(meeting|reunião|call).{0,15}(notes?|notas?|summary|resumo)\b/i))) {
-      const isTomorrow = /\b(tomorrow)\b|amanh[aã]/i.test(msg);
-      const isYesterday = /\b(yesterday)\b|ontem/i.test(msg);
-      const isThisWeek = /\b(this week|esta semana)\b/i.test(msg);
-      const now = new Date();
-      let start: string, end: string;
-
-      if (isYesterday) {
-        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-        start = d.toISOString();
-        end = new Date(d.getTime() + 86400000).toISOString();
-      } else if (isTomorrow) {
-        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-        start = d.toISOString();
-        end = new Date(d.getTime() + 86400000).toISOString();
-      } else if (isThisWeek) {
-        const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
-        start = weekStart.toISOString();
-        end = new Date(weekStart.getTime() + 7 * 86400000).toISOString();
-      } else {
-        // Default: last 3 days
-        start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 3).toISOString();
-        end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
-      }
-
-      // Try to extract a specific meeting name from the message
-      let targetSubject: string | undefined;
-      const aboutMatch = msg.match(/(?:about|from|da|do|de|sobre|with|com)\s+(?:the\s+)?(?:meeting\s+(?:with\s+)?)?["']?([^"'?.!]+)/i);
-      if (aboutMatch) targetSubject = aboutMatch[1].trim();
-
-      const transcriptContext = await getRecentMeetingTranscripts(start, end, targetSubject);
-      context += transcriptContext;
-    }
 
     // Fetch relevant data
     if (msg.match(/\b(calendars?|calend[aá]rios?|schedule|meetings?|events?|agenda|appointments?|what'?s on|compromissos?|reuni[aãõo])/i)) {
@@ -659,16 +633,202 @@ export async function handleMs365Request(userMessage: string, recentHistory: str
       }
     }
 
-    if (msg.match(/\b(emails?|e-?mails?|mails?|inbox|messages?|correio|caixa de entrada)\b/i)) {
-      const emails = await listEmails(10);
-      if (emails.length) {
-        context += "\nRECENT EMAILS:\n" + emails.map(e => {
-          const date = new Date(e.receivedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-          return `- [${e.isRead ? "read" : "UNREAD"}] ${date} — From: ${e.from} — Subject: ${e.subject}\n  Preview: ${e.preview.substring(0, 100)}`;
+    if (msg.match(/\b(tasks?|to.?dos?|tarefas?|work\s*tasks?|pendentes?|pending|checklist|action\s*items?)\b/i)) {
+      // Determine which list(s) the user wants
+      const wantsWork = /\b(work|trabalho|profission)/i.test(msg);
+      const wantsPersonal = /\b(personal|pessoal|my tasks|minhas tarefas)\b/i.test(msg);
+      const wantsSpecific = wantsWork || wantsPersonal;
+
+      let tasks: TodoTask[] = [];
+      const allLists = await listTaskLists();
+
+      if (wantsWork) {
+        // Only the "Work" list
+        const workList = allLists.find(l => l.displayName.toLowerCase() === "work");
+        if (workList) tasks = await listTasks(workList.id, workList.displayName, "status ne 'completed'");
+      } else if (wantsPersonal) {
+        // "Personal" = everything EXCEPT the "Work" list
+        const personalLists = allLists.filter(l => l.displayName.toLowerCase() !== "work");
+        for (const list of personalLists.slice(0, 8)) {
+          try {
+            const t = await listTasks(list.id, list.displayName, "status ne 'completed'");
+            console.log(`  Tasks in "${list.displayName}": ${t.length}`);
+            tasks.push(...t);
+          } catch (e: any) {
+            console.error(`  Failed to fetch "${list.displayName}": ${e.message}`);
+          }
+        }
+      }
+
+      if (!wantsSpecific || tasks.length === 0) {
+        // Generic "tasks" or specific came back empty — fetch from all lists
+        tasks = [];
+        for (const list of allLists.slice(0, 8)) {
+          try {
+            const t = await listTasks(list.id, list.displayName, "status ne 'completed'");
+            console.log(`  Tasks in "${list.displayName}": ${t.length}`);
+            tasks.push(...t);
+          } catch (e: any) {
+            console.error(`  Failed to fetch "${list.displayName}": ${e.message}`);
+          }
+        }
+      }
+      console.log(`  Total tasks fetched: ${tasks.length}`);
+
+      // Show available lists so Claude can reference them
+      context += `\nTASK LISTS: ${allLists.map(l => l.displayName).join(", ")}`;
+
+      if (tasks.length) {
+        context += "\nPENDING TASKS:\n" + tasks.map(t => {
+          const due = t.dueDateTime ? ` (due: ${new Date(t.dueDateTime).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
+          const imp = t.importance === "high" ? " [HIGH]" : "";
+          return `- ${t.title}${due}${imp} — list: ${t.listName}`;
         }).join("\n");
       } else {
-        context += "\nRECENT EMAILS: No emails found.";
+        context += "\nPENDING TASKS: No pending tasks found.";
       }
+    }
+
+    if (msg.match(/\b(emails?|e-?mails?|mails?|inbox|messages?|correio|caixa de entrada)\b/i)) {
+      // Detect if user wants to SEARCH for a specific email (by sender, subject, keyword)
+      const hasSearchIntent =
+        /\b(busca|search|find|procura|acha|localiza|pesquisa)\b/i.test(msg) ||
+        /\b(email|e-mail|mail)\b.{0,40}\b(do|da|de|from|sobre|about|regarding|of)\s+[A-Z\u00C0-\u024F]/i.test(msg) ||
+        /\b(do|da|de|from|sobre|about)\s+[A-Z\u00C0-\u024F].{0,40}\b(email|e-mail|mail)\b/i.test(msg);
+
+      if (hasSearchIntent) {
+        // Extract search terms: strip verbs, articles, "email", prepositions
+        const searchQuery = msg
+          .replace(/\b(busca|search|find|procura|acha|localiza|pesquisa|mostra|show|get|read|ler|me|passe|mostre|ver|check|open|abrir)\b/gi, "")
+          .replace(/\b(o|a|os|as|um|uma|the|an|my|meu|minha|meus|minhas|uns|umas)\b/gi, "")
+          .replace(/\b(emails?|e-?mails?|mails?|inbox|messages?|correio)\b/gi, "")
+          .replace(/\b(do|da|dos|das|de|from|about|sobre|regarding|of|que|que o|que a)\b/gi, "")
+          .replace(/["""''?!.]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        if (searchQuery.length > 2) {
+          console.log(`  Email search query: "${searchQuery}"`);
+          const results = await searchEmails(searchQuery, 5);
+
+          if (results.length) {
+            if (results.length <= 3) {
+              // Auto-fetch full bodies for small result sets
+              context += "\nEMAIL SEARCH RESULTS:\n";
+              for (const email of results) {
+                try {
+                  const full = await readEmail(email.id);
+                  const bodyText = full.body
+                    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+                    .replace(/<[^>]+>/g, " ")
+                    .replace(/&nbsp;/g, " ")
+                    .replace(/&amp;/g, "&")
+                    .replace(/&lt;/g, "<")
+                    .replace(/&gt;/g, ">")
+                    .replace(/\s+/g, " ")
+                    .trim();
+                  const date = new Date(email.receivedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+                  context += `\n--- EMAIL ---\nFrom: ${email.from} <${email.fromEmail}>\nSubject: ${email.subject}\nDate: ${date}\nBody:\n${bodyText.substring(0, 2000)}\n`;
+                } catch {
+                  const date = new Date(email.receivedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+                  context += `\n--- EMAIL ---\nFrom: ${email.from} <${email.fromEmail}>\nSubject: ${email.subject}\nDate: ${date}\nPreview: ${email.preview}\n`;
+                }
+              }
+            } else {
+              context += "\nEMAIL SEARCH RESULTS:\n" + results.map(e => {
+                const date = new Date(e.receivedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+                return `- [${e.isRead ? "read" : "UNREAD"}] ${date} — From: ${e.from} <${e.fromEmail}> — Subject: ${e.subject}\n  Preview: ${e.preview.substring(0, 150)}`;
+              }).join("\n");
+              context += "\n\nMultiple results found. Ask the user which email they want to read in full.";
+            }
+          } else {
+            context += `\nEMAIL SEARCH: No emails found matching "${searchQuery}".`;
+          }
+        } else {
+          // Search terms too short, fall back to listing
+          const emails = await listEmails(10);
+          if (emails.length) {
+            context += "\nRECENT EMAILS:\n" + emails.map(e => {
+              const date = new Date(e.receivedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+              return `- [${e.isRead ? "read" : "UNREAD"}] ${date} — From: ${e.from} <${e.fromEmail}> — Subject: ${e.subject}\n  Preview: ${e.preview.substring(0, 100)}`;
+            }).join("\n");
+          } else {
+            context += "\nRECENT EMAILS: No emails found.";
+          }
+        }
+      } else {
+        // Standard listing — no specific search intent
+        const emails = await listEmails(10);
+        if (emails.length) {
+          context += "\nRECENT EMAILS:\n" + emails.map(e => {
+            const date = new Date(e.receivedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+            return `- [${e.isRead ? "read" : "UNREAD"}] ${date} — From: ${e.from} — Subject: ${e.subject}\n  Preview: ${e.preview.substring(0, 100)}`;
+          }).join("\n");
+        } else {
+          context += "\nRECENT EMAILS: No emails found.";
+        }
+      }
+    }
+
+    // Send email: "send the email", "reply to Ricardo", "enviar email"
+    if (msg.match(/\b(send|reply|respond|forward|enviar?|mandar?|responder?|reenviar?)\b/i) && msg.match(/\b(emails?|e-?mails?|mails?|message|reply|resposta|mensagem)\b|to\s+[A-Z\u00C0-\u024F]/i)) {
+      context += "\n\nACTION AVAILABLE: You can send emails directly. Include this tag:";
+      context += "\n[SEND_EMAIL: recipient@email.com | Subject line | Email body text]";
+      context += "\n  Use the recipient's email address from the email data above (shown in angle brackets after the name).";
+      context += "\n  For replies, use 'Re: original subject' as the subject line.";
+      context += "\n  You CAN send emails — do NOT tell the user the integration is read-only.";
+    }
+
+    // Task creation: "add X to list Y", "adiciona X na lista Y"
+    if (msg.match(/\b(add|create|adiciona|coloca|bota|põe|inclui)\b/i) && msg.match(/\b(list|lista|to.?do|task|tarefa|grocer)/i)) {
+      const allLists = context.includes("TASK LISTS:") ? [] : await listTaskLists();
+      if (!context.includes("TASK LISTS:")) {
+        context += `\nTASK LISTS: ${allLists.map(l => l.displayName).join(", ")}`;
+      }
+      context += "\n\nACTION AVAILABLE: You can create tasks in To Do lists. Include this tag: [CREATE_TASK: list_name | task title]";
+      context += "\n  Example: [CREATE_TASK: Groceries | Nespresso coffee]";
+      context += "\n  Match the list name to the available lists above (case-insensitive, partial match OK).";
+    }
+
+    // For move/reschedule/update/cancel/delete actions, fetch calendar context and offer tags
+    if (msg.match(/\b(move|reschedule|change|push|delay|shift|mover|mudar|trocar|remarcar|adiar|antecipar)\b/i) && msg.match(/\b(meeting|event|lunch|dinner|breakfast|call|calendar|appointment|reuni[aãõo]|almo[cç]o|jantar)\b|to\s+\d|from\s+\d|to\s+(noon|morning|afternoon)/i)) {
+      // Make sure calendar is fetched if not already
+      if (!context.includes("CALENDAR:")) {
+        const now = new Date();
+        const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+        const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7).toISOString();
+        const events = await listCalendarEvents(start, end);
+        if (events.length) {
+          context += "UPCOMING CALENDAR:\n" + events.map(e => {
+            const s = new Date(e.start).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+            const en = new Date(e.end).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+            return `- ${s}-${en}: ${e.subject}${e.location ? ` @ ${e.location}` : ""}`;
+          }).join("\n");
+        }
+      }
+      context += "\n\nACTION AVAILABLE: You can update (reschedule) calendar events. Find the matching event from the calendar above, then include this tag:";
+      context += "\n[UPDATE_EVENT: event_subject_search_text | new_start_datetime (ISO) | new_end_datetime (ISO) | timezone]";
+      context += "\n  Example: [UPDATE_EVENT: Lunch with Fabio | 2026-02-26T12:30:00 | 2026-02-26T13:30:00 | America/Sao_Paulo]";
+      context += "\n  Keep the same duration unless the user specifies otherwise.";
+    }
+
+    if (msg.match(/\b(cancel|delete|remove|cancelar|excluir|remover|apagar)\b/i) && msg.match(/\b(meeting|event|lunch|dinner|call|calendar|appointment)\b/i)) {
+      if (!context.includes("CALENDAR:")) {
+        const now = new Date();
+        const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+        const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7).toISOString();
+        const events = await listCalendarEvents(start, end);
+        if (events.length) {
+          context += "UPCOMING CALENDAR:\n" + events.map(e => {
+            const s = new Date(e.start).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+            const en = new Date(e.end).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+            return `- ${s}-${en}: ${e.subject}${e.location ? ` @ ${e.location}` : ""}`;
+          }).join("\n");
+        }
+      }
+      context += "\n\nACTION AVAILABLE: You can delete calendar events. Include this tag:";
+      context += "\n[DELETE_EVENT: event_subject_search_text]";
+      context += "\n  Example: [DELETE_EVENT: Lunch with Fabio]";
     }
 
     // For create/add/accept actions, try to do them directly
@@ -684,6 +844,47 @@ export async function handleMs365Request(userMessage: string, recentHistory: str
 
     if (msg.match(/\b(draft|save.{0,10}draft|add.{0,10}draft)\b/i)) {
       context += "\n\nACTION AVAILABLE: You can save emails to the Drafts folder. Include this tag: [CREATE_DRAFT: recipient@email.com | Subject line | Email body text]";
+    }
+
+    // Email folder management: create folder, move emails to folder, spam cleanup
+    if (msg.match(/\b(folder|pasta|spam|junk|move|mover|organiz|clean.?up|limp)/i) && msg.match(/\b(email|e-?mail|mail|inbox|caixa|message|mensag)/i)) {
+      // Always fetch emails with IDs for folder operations (replace any prior ID-less listing)
+      const emails = await listEmails(20);
+      if (emails.length) {
+        // Remove prior email listing that lacks IDs
+        context = context.replace(/\nRECENT EMAILS:[\s\S]*?(?=\n[A-Z]|\n\nACTION|$)/, "");
+        context += "\nRECENT EMAILS (with IDs for move operations):\n" + emails.map((e, i) => {
+          const date = new Date(e.receivedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+          return `- [${i}] ID: ${e.id}\n  ${date} — From: ${e.from} <${e.fromEmail}> — Subject: ${e.subject}\n  Preview: ${e.preview.substring(0, 100)}`;
+        }).join("\n");
+      }
+      context += "\n\nACTION AVAILABLE: You can create mail folders and move emails into them.";
+      context += "\n[CREATE_MAIL_FOLDER: folder_name]";
+      context += "\n  Creates a subfolder under Inbox. Example: [CREATE_MAIL_FOLDER: Potential Spam]";
+      context += "\n[MOVE_EMAILS: folder_name | email_id_1, email_id_2, ...]";
+      context += "\n  Moves one or more emails to a folder (creates the folder if it doesn't exist).";
+      context += "\n  Use the email IDs from the email data above.";
+      context += "\n  Example: [MOVE_EMAILS: Potential Spam | AAMkAGQ..., AAMkAGR...]";
+      context += "\n  You can include multiple MOVE_EMAILS tags if needed.";
+      context += "\n  Analyze the emails and identify which ones are spam/marketing before moving.";
+      context += "\n  IMPORTANT: You MUST use the actual email IDs shown above in the MOVE_EMAILS tag. Do NOT say you don't have them — they are listed above.";
+
+      // Load whitelist — these senders should NEVER be moved to spam
+      const whitelist = await loadEmailWhitelist();
+      if (whitelist.length) {
+        context += `\n\n  EMAIL WHITELIST — NEVER move emails from these senders to Potential Spam or any spam folder:`;
+        context += `\n  ${whitelist.join(", ")}`;
+        context += `\n  These are trusted senders confirmed by the user. Always keep their emails in the Inbox.`;
+      }
+    }
+
+    // If no specific data was fetched but this is a confirmation message,
+    // return a hint so the action tags still get injected
+    if (!context) {
+      const isConfirmation = /^(sim|s|ok|pode|manda|envia|send|yes|go|sure|do it|send it|confirmed|approved|please|👍|✅)/i.test(msg.trim());
+      if (isConfirmation) {
+        return "USER CONFIRMATION: The user is confirming a previous action. Check recent conversation history for the pending email, calendar, or task action and execute it using the appropriate action tag.";
+      }
     }
 
     return context || "No relevant MS365 data found for this request.";

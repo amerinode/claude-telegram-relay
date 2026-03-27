@@ -36,7 +36,7 @@ async function run(cmd: string[]): Promise<{ ok: boolean; stdout: string; stderr
 interface ServiceDef {
   name: string;
   script: string;
-  cron?: string;
+  cron?: string | string[];
   description: string;
 }
 
@@ -49,14 +49,29 @@ const SERVICES: Record<string, ServiceDef> = {
   checkin: {
     name: "claude-smart-checkin",
     script: "examples/smart-checkin.ts",
-    cron: "*/30 9-18 * * *",
-    description: "Smart check-ins (every 30 min, 9am-6pm)",
+    cron: [
+      "0 9-17 * * 1-5",   // Weekdays: hourly 9am-5pm (9 times)
+      "0 12 * * 0,6",     // Weekends: noon only
+    ],
+    description: "Smart check-ins (hourly 9am-5pm weekdays, noon weekends)",
   },
   briefing: {
     name: "claude-morning-briefing",
     script: "examples/morning-briefing.ts",
     cron: "0 9 * * *",
     description: "Morning briefing (daily at 9am)",
+  },
+  "inbox-cleanup": {
+    name: "claude-inbox-cleanup",
+    script: "examples/inbox-cleanup.ts",
+    cron: "0 10 * * 1-5",
+    description: "Inbox spam cleanup (daily at 10am, weekdays)",
+  },
+  recap: {
+    name: "claude-friday-recap",
+    script: "examples/friday-recap.ts",
+    cron: "30 16 * * 5",
+    description: "Friday weekly recap (Fridays at 4:30pm)",
   },
 };
 
@@ -71,35 +86,57 @@ async function checkPm2(): Promise<boolean> {
   return false;
 }
 
+async function startPm2(name: string, script: string, cronExpr?: string): Promise<boolean> {
+  // Stop existing first
+  await run(["npx", "pm2", "delete", name]);
+
+  const args = [
+    "npx", "pm2", "start", "bun",
+    "--name", name,
+    "--cwd", PROJECT_ROOT,
+    "-o", join(LOGS_DIR, `${name}.log`),
+    "-e", join(LOGS_DIR, `${name}.error.log`),
+  ];
+
+  if (cronExpr) {
+    // Scheduled service: --cron-restart triggers at the cron time,
+    // --no-autorestart prevents PM2 from restarting it in between
+    args.push("--cron-restart", cronExpr, "--no-autorestart");
+  }
+
+  args.push("--", "run", script);
+  return (await run(args)).ok;
+}
+
 async function installService(config: ServiceDef): Promise<boolean> {
   if (config.cron) {
-    // Scheduled service — show cron instructions
-    console.log(`  ${PASS} ${config.name}: add to crontab manually`);
-    console.log(`      ${dim(`${config.cron} cd ${PROJECT_ROOT} && bun run ${config.script}`)}`);
-    return true;
+    // Scheduled service — use PM2 --cron-restart
+    const crons = Array.isArray(config.cron) ? config.cron : [config.cron];
+
+    let allOk = true;
+    for (let i = 0; i < crons.length; i++) {
+      // Multiple cron expressions get suffixed: name-weekday, name-weekend, etc.
+      const suffix = crons.length > 1 ? `-${i + 1}` : "";
+      const pmName = `${config.name}${suffix}`;
+      const ok = await startPm2(pmName, config.script, crons[i]);
+      if (ok) {
+        console.log(`  ${PASS} ${pmName} scheduled — ${dim(crons[i])}`);
+      } else {
+        console.log(`  ${FAIL} Failed to start ${pmName}`);
+        allOk = false;
+      }
+    }
+    return allOk;
   }
 
-  // Always-on service — use PM2
-  // Stop existing first
-  await run(["npx", "pm2", "delete", config.name]);
-
-  // Use "pm2 start bun -- run <script>" to avoid PM2's broken Bun container
-  // which uses require() and fails on async modules (top-level await)
-  const result = await run([
-    "npx", "pm2", "start", "bun",
-    "--name", config.name,
-    "--cwd", PROJECT_ROOT,
-    "-o", join(LOGS_DIR, `${config.name}.log`),
-    "-e", join(LOGS_DIR, `${config.name}.error.log`),
-    "--", "run", config.script,
-  ]);
-
-  if (result.ok) {
+  // Always-on service
+  const ok = await startPm2(config.name, config.script);
+  if (ok) {
     console.log(`  ${PASS} ${config.name} started — ${config.description}`);
-    return true;
+  } else {
+    console.log(`  ${FAIL} Failed to start ${config.name}`);
   }
-  console.log(`  ${FAIL} Failed to start ${config.name}: ${result.stderr}`);
-  return false;
+  return ok;
 }
 
 async function main() {

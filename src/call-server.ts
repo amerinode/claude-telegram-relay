@@ -28,6 +28,7 @@ import {
   isHospitableConfigured,
   handleHospitableRequest,
   listMessages,
+  getInquiryMessages,
   getReservation,
   sendMessage as sendHospitableMessage,
   formatWebhookMessage,
@@ -114,30 +115,35 @@ setInterval(() => {
  */
 async function handleGuestWebhook(payload: any): Promise<void> {
   const info = formatWebhookMessage(payload);
-  if (!info || !info.messageBody || !info.reservationId) {
-    console.log("Hospitable webhook: no message body or reservation ID, skipping");
+  if (!info || !info.messageBody || !info.conversationId) {
+    console.log("Hospitable webhook: no message body or conversation ID, skipping");
     return;
   }
 
   // Skip messages sent by the host (only notify on guest messages)
-  const senderType = payload.data?.sender || payload.data?.direction || "";
-  if (senderType === "host") {
+  if (info.senderType === "host") {
     console.log("Hospitable webhook: host message, skipping notification");
     return;
   }
 
+  const isInquiry = !info.reservationId && !!info.inquiryId;
   console.log(
-    `Hospitable webhook: ${info.guestName} @ ${info.propertyName}: "${info.messageBody.substring(0, 60)}..."`
+    `Hospitable webhook: ${info.guestName} @ ${info.propertyName} (${isInquiry ? "inquiry" : "reservation"}): "${info.messageBody.substring(0, 60)}..."`
   );
 
   // Fetch recent conversation history for context
   let conversationContext = "";
   try {
-    const messages = await listMessages(info.reservationId, 5);
+    const messages = isInquiry
+      ? await getInquiryMessages(info.inquiryId)
+      : await listMessages(info.reservationId, 5);
     if (messages.length) {
-      conversationContext = messages
-        .reverse()
-        .map((m) => `${m.sender === "guest" ? info.guestName : "You"}: ${m.body}`)
+      const recentMsgs = isInquiry ? messages.slice(-5) : messages;
+      conversationContext = (isInquiry ? recentMsgs : recentMsgs.reverse())
+        .map((m: any) => {
+          const name = (m.senderType || m.sender) === "host" ? "You" : info.guestName;
+          return `${name}: ${m.body}`;
+        })
         .join("\n");
     }
   } catch (e: any) {
@@ -198,9 +204,9 @@ async function handleGuestWebhook(payload: any): Promise<void> {
     draftReply = `Hi ${info.guestName}! Thanks for your message. I'll get back to you shortly.`;
   }
 
-  // Store draft for approval
-  pendingDrafts.set(info.reservationId, {
-    reservationId: info.reservationId,
+  // Store draft for approval (keyed by conversationId which works for both reservations and inquiries)
+  pendingDrafts.set(info.conversationId, {
+    reservationId: info.conversationId,
     draft: draftReply,
     guestName: info.guestName,
     propertyName: info.propertyName,
@@ -214,8 +220,9 @@ async function handleGuestWebhook(payload: any): Promise<void> {
       ? ` (${info.arrivalDate} → ${info.departureDate})`
       : "";
 
+  const typeLabel = isInquiry ? "inquiry" : "reservation";
   const telegramText =
-    `📩 <b>New message from ${escapeHtml(info.guestName)}</b>\n` +
+    `📩 <b>New ${typeLabel} message from ${escapeHtml(info.guestName)}</b>\n` +
     `🏠 ${escapeHtml(info.propertyName)}${dateRange}\n\n` +
     `<i>"${escapeHtml(info.messageBody)}"</i>\n\n` +
     `💬 <b>Suggested reply:</b>\n` +
@@ -224,9 +231,9 @@ async function handleGuestWebhook(payload: any): Promise<void> {
   const keyboard = {
     inline_keyboard: [
       [
-        { text: "✅ Send", callback_data: `hospitable_send:${info.reservationId}` },
-        { text: "✏️ Edit", callback_data: `hospitable_edit:${info.reservationId}` },
-        { text: "❌ Skip", callback_data: `hospitable_skip:${info.reservationId}` },
+        { text: "✅ Send", callback_data: `hospitable_send:${info.conversationId}` },
+        { text: "✏️ Edit", callback_data: `hospitable_edit:${info.conversationId}` },
+        { text: "❌ Skip", callback_data: `hospitable_skip:${info.conversationId}` },
       ],
     ],
   };

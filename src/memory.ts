@@ -127,7 +127,7 @@ export async function getRecentHistory(
   try {
     const { data, error } = await supabase
       .from("messages")
-      .select("role, content, created_at")
+      .select("role, content, channel, created_at")
       .order("created_at", { ascending: false })
       .limit(limit);
 
@@ -139,7 +139,10 @@ export async function getRecentHistory(
     return (
       "RECENT CONVERSATION:\n" +
       messages
-        .map((m: any) => `[${m.role}]: ${m.content}`)
+        .map((m: any) => {
+          const channelTag = m.channel && m.channel !== "telegram" ? ` (${m.channel})` : "";
+          return `[${m.role}${channelTag}]: ${m.content}`;
+        })
         .join("\n")
     );
   } catch (error) {
@@ -160,7 +163,7 @@ export async function getRelevantContext(
 
   try {
     const { data, error } = await supabase.functions.invoke("search", {
-      body: { query, match_count: 5, table: "messages" },
+      body: { query, match_count: 10, table: "messages" },
     });
 
     if (error || !data?.length) return "";

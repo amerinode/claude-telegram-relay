@@ -62,16 +62,42 @@ CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 
 -- ============================================================
+-- ALERT DEDUP TABLE (Smart Check-in)
+-- ============================================================
+-- Tracks which alerts were sent to Telegram today.
+-- Once per calendar day per item — resets the next day.
+CREATE TABLE IF NOT EXISTS alert_dedup (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  alert_date DATE NOT NULL,
+  alert_type TEXT NOT NULL CHECK (alert_type IN ('guest', 'task', 'email', 'calendar', 'whatsapp')),
+  item_key TEXT NOT NULL,
+  alerted_at TIMESTAMPTZ DEFAULT NOW(),
+  metadata JSONB DEFAULT '{}',
+  CONSTRAINT uq_alert_per_day UNIQUE (alert_date, alert_type, item_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_dedup_date_type ON alert_dedup(alert_date, alert_type);
+
+-- Auto-cleanup: delete rows older than 7 days
+CREATE OR REPLACE FUNCTION cleanup_old_alerts() RETURNS void AS $$
+BEGIN
+  DELETE FROM alert_dedup WHERE alert_date < CURRENT_DATE - INTERVAL '7 days';
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
 -- ROW LEVEL SECURITY
 -- ============================================================
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memory ENABLE ROW LEVEL SECURITY;
 ALTER TABLE logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alert_dedup ENABLE ROW LEVEL SECURITY;
 
 -- Allow all for service role (your bot uses service key)
 CREATE POLICY "Allow all for service role" ON messages FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON memory FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON logs FOR ALL USING (true);
+CREATE POLICY "Allow all for service role" ON alert_dedup FOR ALL USING (true);
 
 -- ============================================================
 -- HELPER FUNCTIONS
