@@ -25,18 +25,11 @@ import {
   handleMs365Request,
   listCalendarEvents,
   createCalendarEvent,
-  updateCalendarEvent,
-  deleteCalendarEvent,
   acceptCalendarEvent,
   declineCalendarEvent,
   sendEmail,
   createDraft,
-  createTask,
-  findTaskList,
-  searchEmails,
-  readEmail,
-  getOrCreateMailFolder,
-  moveEmail,
+  getMeetingTranscript,
 } from "./ms365.ts";
 import {
   handleHospitableRequest,
@@ -44,7 +37,8 @@ import {
   sendInquiryMessage,
   syncTransactionsToSupabase,
 } from "./hospitable.ts";
-import { needsSearch, searchWeb, isFlightSearch, isHotelSearch, searchFlights, searchHotels } from "./search.ts";
+import { createMeetingPage, isNotionEnabled } from "./notion.ts";
+import { needsSearch, searchWeb } from "./search.ts";
 import { processFileActions } from "./file-gen.ts";
 import { makeCall, isCallConfigured } from "./call.ts";
 
@@ -221,15 +215,14 @@ const supabase: SupabaseClient | null =
 async function saveMessage(
   role: string,
   content: string,
-  metadata?: Record<string, unknown>,
-  channel: string = "telegram"
+  metadata?: Record<string, unknown>
 ): Promise<void> {
   if (!supabase) return;
   try {
     await supabase.from("messages").insert({
       role,
       content,
-      channel,
+      channel: "telegram",
       metadata: metadata || {},
     });
   } catch (error) {
@@ -274,25 +267,10 @@ async function callClaude(
   // Claude CLI detects piped stdin and runs in non-interactive mode automatically.
   const claudeArgs = ["--no-session-persistence", "--output-format", "text"];
 
-  // Allow WebFetch for URL access, Write for file creation,
-  // and Chrome MCP tools for browser automation.
+  // Allow WebFetch for URL access and Write for file creation.
   // Web search is handled directly by the relay via Brave Search API
   // (MCP approach crashes Bun on Windows ARM64).
-  claudeArgs.push(
-    "--allowedTools",
-    [
-      "Read",
-      "WebFetch",
-      "Write",
-      "mcp__Claude_in_Chrome__tabs_context_mcp",
-      "mcp__Claude_in_Chrome__navigate",
-      "mcp__Claude_in_Chrome__read_page",
-      "mcp__Claude_in_Chrome__find",
-      "mcp__Claude_in_Chrome__get_page_text",
-      "mcp__Claude_in_Chrome__computer",
-      "mcp__Claude_in_Chrome__form_input",
-    ].join(",")
-  );
+  claudeArgs.push("--allowedTools", "WebFetch,Write");
 
   console.log(`Calling Claude (${prompt.length} chars): ${prompt.substring(0, 50)}...`);
 
@@ -327,14 +305,13 @@ async function callClaude(
       child.stdout?.on("data", (d: Buffer) => { output += d.toString(); });
       child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
 
-      // Kill after 5 minutes to prevent indefinite hanging
-      // (browser automation via Chrome MCP may need extra time)
+      // Kill after 3 minutes to prevent indefinite hanging
       const timeout = setTimeout(() => {
-        console.error("Claude CLI timed out after 5 minutes");
+        console.error("Claude CLI timed out after 3 minutes");
         child.kill("SIGTERM");
         unlink(promptFile).catch(() => {});
         safeResolve("Claude took too long to respond. Try a simpler question or try again.");
-      }, 300_000);
+      }, 180_000);
 
       // Pipe the prompt file to stdin
       const fs = require("fs");
@@ -384,16 +361,14 @@ async function callClaude(
  * Uses action-oriented patterns to avoid false positives when
  * the user merely *mentions* email/calendar in conversation.
  */
-function needsMs365(message: string, recentHistory?: string): boolean {
+function needsMs365(message: string): boolean {
   if (process.env.MS365_ENABLED !== "true") return false;
 
   const ms365ActionPatterns = [
     // Email actions: fetch, read, check, show, open, list, send, delete, forward
     /\b(show|read|check|fetch|list|open|get|find|search|send|forward|reply|delete|move|compose|draft|write)\b.{0,20}\b(emails?|e-mails?|mails?|inbox|messages?)\b/i,
     /\b(emails?|e-mails?|mails?|inbox)\b.{0,20}\b(from|to|today|this week|unread|latest|recent|new)\b/i,
-    /\b(enviar|ler|busca[r]?|mostra[r]?|abri[r]?|verifica[r]?|checa[r]?|manda[r]?|procura[r]?|pesquisa[r]?|acha[r]?|pega[r]?)\b.{0,20}\b(emails?|e-mails?)\b/i,
-    /\b(busca|procura|pesquisa|acha|pega)\b.{0,30}\b(emails?|e-mails?|mail|inbox)\b/i,
-    /\b(emails?|e-mails?)\b.{0,30}\b(do|da|de)\s+\w/i,
+    /\b(enviar|ler|buscar|mostrar|abrir|verificar|checar|mandar)\b.{0,20}\b(emails?|e-mails?)\b/i,
     // Conversational Portuguese: "tenho email?", "algum email", "meus emails", "chegou email", "tem email"
     /\b(tenho|tem|chegou|recebi|recebeu|algum|alguma|meus|minhas|novo|nova|importantes?)\b.{0,20}\b(emails?|e-mails?)\b/i,
     /\b(emails?|e-mails?)\b.{0,20}\b(novo|nova|novos|novas|importantes?|pendentes?|hoje|recentes?|pra mim|para mim)\b/i,
@@ -416,73 +391,19 @@ function needsMs365(message: string, recentHistory?: string): boolean {
     /\b(add|put).{0,15}(calendar|my cal)\b/i,
     // Confirm/accept meetings
     /\b(accept|confirm|rsvp|decline)\b.{0,20}\b(meeting|event|invite|calendar)\b/i,
-    // Tasks / To Do
-    /\b(show|check|list|get|fetch|what are)\b.{0,20}\b(tasks?|to.?dos?|action.?items?)\b/i,
-    /\b(my|work|pending|open)\b.{0,10}\b(tasks?|to.?dos?)\b/i,
-    /\b(tarefas?|pendentes?|pendências)\b/i,
-    /\b(complete|finish|done with|mark.{0,10}done)\b.{0,20}\b(task|to.?do)\b/i,
-    // Add/create tasks: "add X to list Y", "adiciona X na lista Y"
-    /\b(add|create|adiciona|coloca|bota|põe|inclui)\b.{0,40}\b(list|lista|to.?do|grocer)/i,
-    /\b(adiciona|coloca|bota|põe|inclui)\b/i,
+    // Meeting transcripts
+    /\b(transcript|transcrição|transcription|transcri[çc])\b/i,
+    /\b(what|o que).{0,15}(was|were|foi|foram).{0,15}(discussed|decided|said|talked|falado|decidido|discutido)\b/i,
+    /\b(who|quem).{0,15}(said|falou|disse)\b.{0,20}\b(in|na|no|at|during)\b/i,
+    /\b(meeting|reunião|call|chamada).{0,15}(notes?|notas?|summary|resumo)\b/i,
+    /\b(action items?|follow.?ups?|takeaways?|next steps?)\b.{0,20}\b(from|da|do).{0,15}\b(meeting|call|reunião)\b/i,
+    /\b(last|latest|recent|última|último)\b.{0,15}\b(meeting|call|reunião|sync)\b/i,
+    // Notion sync triggers
+    /\b(push|save|sync|send|add)\b.{0,15}\b(to\s+)?notion\b/i,
+    /\bnotion\b.{0,15}\b(sync|push|save|add)\b/i,
   ];
 
-  if (ms365ActionPatterns.some(p => p.test(message))) return true;
-
-  // History-aware: confirmation of a pending MS365 action (send email, calendar change, etc.)
-  if (recentHistory && isConfirmationWithMs365History(message, recentHistory)) return true;
-
-  return false;
-}
-
-/**
- * Check if a short confirmation message follows a recent MS365 interaction.
- * This catches "send it", "yes", "manda" etc. when the bot just proposed sending an email
- * or making a calendar change.
- */
-function isConfirmationWithMs365History(message: string, recentHistory: string): boolean {
-  const msg = message.toLowerCase().trim();
-
-  const confirmationPatterns = [
-    /^(sim|s|ok|pode|manda|envia|envie|confirma|isso|perfeito|vai|bora|beleza|boa|mande|pode mandar|pode enviar|confirmo|aprovado|tá bom|manda bala|solta|dispara)$/i,
-    /^(sim|pode|manda|envia|confirma).{0,40}$/i,
-    /^(yes|y|ok|sure|send|go ahead|do it|confirmed|approved|perfect|sounds good|send it|yep|yeah|please|please send|go for it)$/i,
-    /^(yes|send|go).{0,30}$/i,
-    /^(👍|✅|💪|🚀)$/,
-  ];
-
-  const isShortConfirmation = confirmationPatterns.some(p => p.test(msg));
-
-  // Check if recent history involves MS365 actions (email drafts, calendar proposals, etc.)
-  const historySignals = [
-    /\b(draft|rascunho)\b.{0,30}\b(email|e-mail|reply|resposta)\b/i,
-    /\b(send|enviar|mandar)\b.{0,20}\b(email|e-mail|reply|resposta)\b/i,
-    /should I send|want me to send|quer que eu (envie|mande)/i,
-    /\b(To:|Para:|Subject:|Assunto:|Re:)\b/i,
-    /SEND_EMAIL|CREATE_DRAFT|CREATE_EVENT|UPDATE_EVENT|DELETE_EVENT|ACCEPT_EVENT/i,
-    /\b(reply|respond|draft|message)\b.{0,30}\b(to|para)\b/i,
-    /here'?s.{0,20}(draft|email|reply|message)/i,
-    /adjust.{0,20}(tone|before you send|antes de enviar)/i,
-    /Mail\.Send|read.only|can't send|cannot send/i,
-  ];
-
-  const historyHasMs365 = historySignals.some(p => p.test(recentHistory));
-
-  // Short confirmations ("send it", "yes", "manda") with MS365 history
-  if (isShortConfirmation && historyHasMs365) return true;
-
-  // Follow-up messages in an active MS365 conversation:
-  // - Message contains an email address
-  // - Message references email/sending in context of recent MS365 history
-  if (historyHasMs365) {
-    // Contains an email address
-    if (/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/.test(message)) return true;
-    // References email-related actions or provides info for pending action
-    if (/\b(his|her|their|the|ricardo'?s?|that)\b.{0,15}\b(email|e-mail|address)\b/i.test(msg)) return true;
-    // User is providing info or correction for a pending MS365 action
-    if (/\b(next time|from now on|going forward|it'?s?\s|it is|here'?s?|aqui|é\s)\b/i.test(msg)) return true;
-  }
-
-  return false;
+  return ms365ActionPatterns.some(p => p.test(message));
 }
 
 // ============================================================
@@ -492,7 +413,7 @@ function isConfirmationWithMs365History(message: string, recentHistory: string):
 /**
  * Check if a user message requires Hospitable (vacation rental) data.
  */
-function needsHospitable(message: string, recentHistory?: string): boolean {
+function needsHospitable(message: string): boolean {
   if (process.env.HOSPITABLE_ENABLED !== "true") return false;
 
   const hospitablePatterns = [
@@ -522,46 +443,12 @@ function needsHospitable(message: string, recentHistory?: string): boolean {
     // Financial / earnings
     /\b(earn|revenue|payout|transaction|financ|income|billing)\b/i,
     /\b(fatur|ganhos?|receita|quanto.?(fiz|ganhei|faturei|recebi))\b/i,
-    /\b(how.?much.?(did|do|have|has|am|are|is|was|will|would|earn|made?|get|owe|pay|charg|receiv|spend|spent|cost))\b/i,
+    /\b(how.?much.?(did|have|earn|made?))\b/i,
     /\b(soma|sum|total).{0,15}(reserv|booking|month|mês|mes)/i,
     /\b(relatório|report).{0,15}(financ|reserv|booking|mensal|monthly)/i,
   ];
 
-  if (hospitablePatterns.some(p => p.test(message))) return true;
-
-  // History-aware: confirmation of a pending Hospitable action
-  if (recentHistory && isConfirmationWithHospitableHistory(message, recentHistory)) return true;
-
-  return false;
-}
-
-/**
- * Check if a short confirmation message follows a recent Hospitable interaction.
- * This catches "sim", "yes", "manda" etc. when the bot just proposed sending a guest message.
- */
-function isConfirmationWithHospitableHistory(message: string, recentHistory: string): boolean {
-  const msg = message.toLowerCase().trim();
-
-  const confirmationPatterns = [
-    /^(sim|s|ok|pode|manda|envia|envie|confirma|isso|perfeito|vai|bora|beleza|boa|mande|pode mandar|pode enviar|confirmo|aprovado|tá bom|manda bala|solta|dispara)$/i,
-    /^(sim|pode|manda|envia|confirma).{0,40}$/i,
-    /^(yes|y|ok|sure|send|go ahead|do it|confirmed|approved|perfect|sounds good|send it|yep|yeah|please|please send|go for it)$/i,
-    /^(yes|send|go).{0,30}$/i,
-    /^(👍|✅|💪|🚀)$/,
-  ];
-
-  if (!confirmationPatterns.some(p => p.test(msg))) return false;
-
-  const historySignals = [
-    /uuid:\s*[0-9a-f]{8}-[0-9a-f]{4}/i,
-    /HOSPITABLE/i,
-    /mensagem.{0,20}(hóspede|guest)/i,
-    /message.{0,20}guest/i,
-    /should I send|quer que eu (envie|mande)|posso (enviar|mandar)/i,
-    /enviar.{0,15}(pelo|via|no).{0,15}(airbnb|hospitable)/i,
-  ];
-
-  return historySignals.some(p => p.test(recentHistory));
+  return hospitablePatterns.some(p => p.test(message));
 }
 
 /**
@@ -627,8 +514,6 @@ async function processCallActions(response: string): Promise<string> {
  * Process MS365 action tags in Claude's response.
  * Claude can include these tags to trigger real actions:
  *   [CREATE_EVENT: subject | start_datetime | end_datetime | timezone]
- *   [UPDATE_EVENT: event_subject_search_text | start_datetime | end_datetime | timezone]
- *   [DELETE_EVENT: event_subject_search_text]
  *   [ACCEPT_EVENT: event_subject_search_text]
  *   [DECLINE_EVENT: event_subject_search_text]
  *   [SEND_EMAIL: to@addr | subject | body]
@@ -650,55 +535,6 @@ async function processMs365Actions(response: string): Promise<string> {
     } catch (error: any) {
       console.error("Create event error:", error.message);
       clean = clean.replace(match[0], `❌ Could not create event: ${error.message}`);
-    }
-  }
-
-  // [UPDATE_EVENT: search text | start | end | timezone]
-  for (const match of response.matchAll(/\[UPDATE_EVENT:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*(?:\|\s*(.+?))?\]/gi)) {
-    try {
-      const searchText = match[1].trim().toLowerCase();
-      // Search today and tomorrow to find the event
-      const now = new Date();
-      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-      const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7).toISOString();
-      const events = await listCalendarEvents(start, end);
-      const event = events.find(e => e.subject.toLowerCase().includes(searchText));
-      if (event) {
-        const result = await updateCalendarEvent(event.id, {
-          startDateTime: match[2].trim(),
-          endDateTime: match[3].trim(),
-          timeZone: match[4]?.trim(),
-        });
-        console.log(`Updated calendar event: ${result.subject} (${result.id})`);
-        clean = clean.replace(match[0], `✅ Event updated: ${result.subject}`);
-      } else {
-        clean = clean.replace(match[0], `❌ Could not find event matching "${match[1].trim()}"`);
-      }
-    } catch (error: any) {
-      console.error("Update event error:", error.message);
-      clean = clean.replace(match[0], `❌ Could not update event: ${error.message}`);
-    }
-  }
-
-  // [DELETE_EVENT: search text]
-  for (const match of response.matchAll(/\[DELETE_EVENT:\s*(.+?)\]/gi)) {
-    try {
-      const searchText = match[1].trim().toLowerCase();
-      const now = new Date();
-      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-      const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7).toISOString();
-      const events = await listCalendarEvents(start, end);
-      const event = events.find(e => e.subject.toLowerCase().includes(searchText));
-      if (event) {
-        await deleteCalendarEvent(event.id);
-        console.log(`Deleted calendar event: ${event.subject} (${event.id})`);
-        clean = clean.replace(match[0], `✅ Event deleted: ${event.subject}`);
-      } else {
-        clean = clean.replace(match[0], `❌ Could not find event matching "${match[1].trim()}"`);
-      }
-    } catch (error: any) {
-      console.error("Delete event error:", error.message);
-      clean = clean.replace(match[0], `❌ Could not delete event: ${error.message}`);
     }
   }
 
@@ -756,22 +592,57 @@ async function processMs365Actions(response: string): Promise<string> {
     }
   }
 
-  // [CREATE_TASK: list_name | task title]
-  for (const match of response.matchAll(/\[CREATE_TASK:\s*(.+?)\s*\|\s*(.+?)\]/gi)) {
+  // [SYNC_TO_NOTION: meeting subject search text]
+  for (const match of response.matchAll(/\[SYNC_TO_NOTION:\s*(.+?)\]/gi)) {
+    if (!isNotionEnabled()) {
+      clean = clean.replace(match[0], `❌ Notion not configured (set NOTION_API_KEY and NOTION_MEETINGS_DB_ID)`);
+      continue;
+    }
     try {
-      const listName = match[1].trim();
-      const taskTitle = match[2].trim();
-      const list = await findTaskList(listName);
-      if (list) {
-        const result = await createTask(list.id, taskTitle);
-        console.log(`Created task "${result.title}" in list "${list.displayName}" (${result.id})`);
-        clean = clean.replace(match[0], `✅ Added "${result.title}" to ${list.displayName}`);
-      } else {
-        clean = clean.replace(match[0], `❌ Could not find list "${listName}"`);
+      const searchText = match[1].trim();
+      // Find matching meeting from recent calendar
+      const now = new Date();
+      const threeDaysAgo = new Date(now.getTime() - 3 * 86400000).toISOString();
+      const events = await listCalendarEvents(threeDaysAgo, now.toISOString(), 20);
+      const teamsEvents = events.filter(e => e.isOnline && e.onlineUrl);
+      const target = searchText.toLowerCase();
+      const matched = teamsEvents.find(e =>
+        e.subject.toLowerCase().includes(target) ||
+        target.split(/\s+/).filter(w => w.length > 3).some(w => e.subject.toLowerCase().includes(w))
+      );
+
+      if (!matched || !matched.onlineUrl) {
+        clean = clean.replace(match[0], `❌ No Teams meeting found matching "${searchText}"`);
+        continue;
       }
+
+      const transcript = await getMeetingTranscript(matched.onlineUrl, matched.subject);
+      if (!transcript) {
+        clean = clean.replace(match[0], `❌ No transcript available for "${matched.subject}"`);
+        continue;
+      }
+
+      // Calculate duration
+      const durationMin = Math.round((new Date(matched.end).getTime() - new Date(matched.start).getTime()) / 60000);
+      const durationStr = durationMin >= 60
+        ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}min`
+        : `${durationMin} min`;
+
+      const page = await createMeetingPage({
+        subject: matched.subject,
+        date: matched.start,
+        endDate: matched.end,
+        organizer: matched.organizer,
+        duration: durationStr,
+        summary: "Meeting transcript synced via Ona. Full summary in page body.",
+        fullTranscript: transcript,
+      });
+
+      console.log(`Synced to Notion: ${matched.subject} → ${page.id}`);
+      clean = clean.replace(match[0], `✅ Synced "${matched.subject}" to Notion`);
     } catch (error: any) {
-      console.error("Create task error:", error.message);
-      clean = clean.replace(match[0], `❌ Could not create task: ${error.message}`);
+      console.error("Notion sync error:", error.message);
+      clean = clean.replace(match[0], `❌ Notion sync failed: ${error.message}`);
     }
   }
 
@@ -788,59 +659,6 @@ async function processMs365Actions(response: string): Promise<string> {
     } catch (error: any) {
       console.error("Create draft error:", error.message);
       clean = clean.replace(match[0], `❌ Could not create draft: ${error.message}`);
-    }
-  }
-
-  // [CREATE_MAIL_FOLDER: folder_name]
-  for (const match of response.matchAll(/\[CREATE_MAIL_FOLDER:\s*(.+?)\]/gi)) {
-    try {
-      const folderName = match[1].trim();
-      const result = await getOrCreateMailFolder(folderName);
-      if (result.created) {
-        console.log(`Created mail folder: ${result.displayName} (${result.id})`);
-        clean = clean.replace(match[0], `✅ Folder created: "${result.displayName}"`);
-      } else {
-        console.log(`Mail folder already exists: ${result.displayName} (${result.id})`);
-        clean = clean.replace(match[0], `✅ Folder already exists: "${result.displayName}"`);
-      }
-    } catch (error: any) {
-      console.error("Create folder error:", error.message);
-      clean = clean.replace(match[0], `❌ Could not create folder: ${error.message}`);
-    }
-  }
-
-  // [MOVE_EMAILS: folder_name | email_id_1, email_id_2, ...]
-  for (const match of response.matchAll(/\[MOVE_EMAILS:\s*(.+?)\s*\|\s*([\s\S]+?)\]/gi)) {
-    try {
-      const folderName = match[1].trim();
-      const emailIds = match[2].split(",").map(id => id.trim()).filter(Boolean);
-
-      // Get or create the destination folder
-      const folder = await getOrCreateMailFolder(folderName);
-      if (folder.created) {
-        console.log(`Created folder "${folder.displayName}" for email move`);
-      }
-
-      let moved = 0;
-      let failed = 0;
-      for (const emailId of emailIds) {
-        try {
-          await moveEmail(emailId, folder.id);
-          moved++;
-        } catch (e: any) {
-          console.error(`Failed to move email ${emailId.substring(0, 20)}...: ${e.message}`);
-          failed++;
-        }
-      }
-
-      console.log(`Moved ${moved}/${emailIds.length} emails to "${folder.displayName}"`);
-      const status = failed > 0
-        ? `✅ Moved ${moved} email${moved !== 1 ? "s" : ""} to "${folder.displayName}" (${failed} failed)`
-        : `✅ Moved ${moved} email${moved !== 1 ? "s" : ""} to "${folder.displayName}"`;
-      clean = clean.replace(match[0], status);
-    } catch (error: any) {
-      console.error("Move emails error:", error.message);
-      clean = clean.replace(match[0], `❌ Could not move emails: ${error.message}`);
     }
   }
 
@@ -863,14 +681,14 @@ bot.on("message:text", async (ctx) => {
 
     // Gather context: recent history + semantic search + facts/goals
     const [recentHistory, relevantContext, memoryContext] = await Promise.all([
-      getRecentHistory(supabase, 50),
+      getRecentHistory(supabase, 20),
       getRelevantContext(supabase, text),
       getMemoryContext(supabase),
     ]);
 
     // Check if we need MS365 data (email/calendar)
     let ms365Context = "";
-    if (needsMs365(text, recentHistory)) {
+    if (needsMs365(text)) {
       console.log("MS365 request detected, fetching data via Graph API...");
       ms365Context = await handleMs365Request(text, recentHistory);
       console.log(`MS365 context: ${ms365Context.substring(0, 100)}...`);
@@ -878,7 +696,7 @@ bot.on("message:text", async (ctx) => {
 
     // Check if we need Hospitable data (vacation rentals)
     let hospitableContext = "";
-    if (needsHospitable(text, recentHistory)) {
+    if (needsHospitable(text)) {
       console.log("Hospitable request detected, fetching data...");
       hospitableContext = await handleHospitableRequest(text, recentHistory);
       console.log(`Hospitable context: ${hospitableContext.substring(0, 100)}...`);
@@ -892,19 +710,7 @@ bot.on("message:text", async (ctx) => {
       if (searchContext) console.log(`Search context: ${searchContext.substring(0, 100)}...`);
     }
 
-    // Check for /flights or /hotels commands
-    let travelContext = "";
-    if (isFlightSearch(text)) {
-      console.log("Flight search command detected, running multi-search...");
-      travelContext = await searchFlights(text);
-      if (travelContext) console.log(`Flight context: ${travelContext.substring(0, 100)}...`);
-    } else if (isHotelSearch(text)) {
-      console.log("Hotel search command detected, running multi-search...");
-      travelContext = await searchHotels(text);
-      if (travelContext) console.log(`Hotel context: ${travelContext.substring(0, 100)}...`);
-    }
-
-    const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext, searchContext, travelContext);
+    const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, recentHistory, ms365Context, hospitableContext, searchContext);
 
     // Snapshot files directory before Claude call
     const filesBefore = await snapshotFiles();
@@ -969,21 +775,21 @@ bot.on("message:voice", async (ctx) => {
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
     const [recentHistory, relevantContext, memoryContext] = await Promise.all([
-      getRecentHistory(supabase, 50),
+      getRecentHistory(supabase, 20),
       getRelevantContext(supabase, transcription),
       getMemoryContext(supabase),
     ]);
 
     // Check if we need MS365 data (email/calendar)
     let ms365Context = "";
-    if (needsMs365(transcription, recentHistory)) {
+    if (needsMs365(transcription)) {
       console.log("MS365 request detected in voice, fetching data via Graph API...");
       ms365Context = await handleMs365Request(transcription, recentHistory);
     }
 
     // Check if we need Hospitable data (vacation rentals)
     let hospitableContext = "";
-    if (needsHospitable(transcription, recentHistory)) {
+    if (needsHospitable(transcription)) {
       console.log("Hospitable request detected in voice, fetching data...");
       hospitableContext = await handleHospitableRequest(transcription, recentHistory);
     }
@@ -1052,9 +858,9 @@ bot.on("message:photo", async (ctx) => {
     const buffer = await response.arrayBuffer();
     await writeFile(filePath, Buffer.from(buffer));
 
-    // Claude Code can read images via the Read tool
+    // Claude Code can see images via file path
     const caption = ctx.message.caption || "Analyze this image.";
-    const prompt = `The user sent an image. Use the Read tool to view this image file: ${filePath}\n\n${caption}`;
+    const prompt = `[Image: ${filePath}]\n\n${caption}`;
 
     await saveMessage("user", `[Image]: ${caption}`);
 
@@ -1130,8 +936,7 @@ function buildPrompt(
   recentHistory?: string,
   ms365Context?: string,
   hospitableContext?: string,
-  searchContext?: string,
-  travelContext?: string
+  searchContext?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -1166,30 +971,24 @@ function buildPrompt(
         "\nWhen the user asks you to take actions on their email or calendar, include these tags:" +
         "\n[CREATE_EVENT: subject | start_datetime (ISO) | end_datetime (ISO) | timezone]" +
         "\n  Example: [CREATE_EVENT: Lunch with Niki | 2026-02-18T12:00:00 | 2026-02-18T13:00:00 | America/New_York]" +
-        "\n[UPDATE_EVENT: event_subject_search_text | new_start_datetime (ISO) | new_end_datetime (ISO) | timezone]" +
-        "\n  Use UPDATE_EVENT when the user wants to move, reschedule, or change the time of an existing event." +
-        "\n  Example: [UPDATE_EVENT: Lunch with Fabio | 2026-02-26T12:30:00 | 2026-02-26T13:30:00 | America/Sao_Paulo]" +
-        "\n  Keep the same duration unless the user specifies otherwise." +
-        "\n[DELETE_EVENT: event_subject_search_text]" +
-        "\n  Use DELETE_EVENT when the user wants to cancel or remove an event." +
         "\n[ACCEPT_EVENT: event subject text to search]" +
         "\n[DECLINE_EVENT: event subject text to search]" +
         "\n[SEND_EMAIL: recipient@email.com | Subject line | Email body text]" +
-        "\n[CREATE_TASK: list_name | task title]" +
-        "\n  Example: [CREATE_TASK: Groceries | Nespresso coffee]" +
-        "\n  Match the list name from the TASK LISTS shown in the MS365 data. Use the closest match." +
         "\n[CREATE_DRAFT: recipient@email.com | Subject line | Email body text]" +
         "\n  Use CREATE_DRAFT when the user asks to save a draft, add to drafts, or write an email without sending it." +
-        "\n[CREATE_MAIL_FOLDER: folder_name]" +
-        "\n  Creates a subfolder under Inbox. Example: [CREATE_MAIL_FOLDER: Potential Spam]" +
-        "\n[MOVE_EMAILS: folder_name | email_id_1, email_id_2, ...]" +
-        "\n  Moves emails to a folder (auto-creates folder if needed). Use actual email IDs from the data above." +
-        "\n  Example: [MOVE_EMAILS: Potential Spam | AAMkAGQ..., AAMkAGR...]" +
         "\nThese tags are processed automatically — include them in your response along with a human-friendly confirmation." +
-        "\nIMPORTANT: When the user asks to MOVE or RESCHEDULE an event, use UPDATE_EVENT (not CREATE_EVENT + manual delete)." +
         "\nAlways CONFIRM with the user before sending emails or making calendar changes." +
         "\nFor drafts, you can save directly when the user asks — no confirmation needed since it doesn't send anything." +
-        "\nSummarize emails concisely rather than showing raw data."
+        "\nSummarize emails concisely rather than showing raw data." +
+        "\n\nMEETING TRANSCRIPTS:" +
+        "\nWhen transcript data is included above, summarize the key points, decisions, and action items." +
+        "\nIdentify who said what when the user asks about specific speakers." +
+        "\nIf the user asks for the full transcript, present it with speaker names and timestamps." +
+        "\nFocus on actionable content: decisions made, tasks assigned, deadlines mentioned." +
+        "\n\nNOTION SYNC:" +
+        "\nWhen the user asks to push/save/sync a meeting to Notion, include this tag:" +
+        "\n[SYNC_TO_NOTION: meeting subject search text]" +
+        "\nThis syncs the transcript summary to their Notion meetings database."
     );
   }
 
@@ -1205,9 +1004,6 @@ function buildPrompt(
         "\n  Example: [SEND_INQUIRY_MESSAGE: 90683af9-9dbd-4583-9a12-4f0b8dea3124 | Hi! Yes, those dates work perfectly.]" +
         "\nThe UUID and type (reservation vs inquiry) are provided in the data above." +
         "\nAlways CONFIRM with the user before sending messages to guests." +
-        "\nWhen the user CONFIRMS a previously proposed message (e.g., 'sim', 'yes', 'manda', 'send it')," +
-        "\nimmediately emit the action tag with the correct UUID and the message body from your previous response." +
-        "\nDo NOT ask the user to copy/paste — you CAN send messages directly through Hospitable." +
         "\n\nINBOX PRESENTATION STYLE:" +
         "\nWhen the user asks for 'messages' or 'inbox', present the data as a clear summary:" +
         "\n- Group by urgency: NEEDS YOUR ATTENTION first, then WAITING ON GUEST, then DEAD THREADS" +
@@ -1226,38 +1022,6 @@ function buildPrompt(
       "\nUse the search results above to answer the user's question with current information. " +
         "Cite specific facts from the results. If the results don't fully answer the question, say so."
     );
-  }
-
-  // Travel skills: /flights and /hotels
-  if (travelContext) {
-    parts.push(`\n${travelContext}`);
-
-    if (userMessage.trim().toLowerCase().startsWith("/flights")) {
-      parts.push(
-        "\nFLIGHT SEARCH EXPERT MODE:" +
-          "\nYou have real-time flight data above (from Kiwi.com API or web search fallback)." +
-          "\nPresent the results clearly and concisely:" +
-          "\n1. List the top flights: price, airline, duration, stops, departure times" +
-          "\n2. Highlight the BEST VALUE — cheapest, shortest, or best airline" +
-          "\n3. Include the booking link (🔗) for each flight so the user can book with one tap" +
-          "\n4. If checked bag prices are shown, mention total cost with 1 checked bag" +
-          "\n5. If seats are limited, flag urgency (e.g. '⚠️ only 3 seats left')" +
-          "\n6. Suggest trying nearby dates or alternate airports for even cheaper options" +
-          "\n7. If the data came from web search (not API), note that prices are approximate" +
-          "\nBe specific, actionable, and concise. Use $USD prices." +
-          "\nIf the user only said '/flights' without details, ask them: origin city, destination, approximate dates, and if they're flexible."
-      );
-    } else if (userMessage.trim().toLowerCase().startsWith("/hotels")) {
-      parts.push(
-        "\nHOTEL & DINING EXPERT MODE:" +
-          "\nYou are a budget travel expert. Using the search results above, provide:" +
-          "\n1. Three hotel or Airbnb options near central locations or popular attractions — with name, price per night, location, and why it's a good pick" +
-          "\n2. Three local restaurant recommendations where meals are affordable and loved by locals — with name, cuisine, price range, and what to order" +
-          "\nPrioritize value: good location + good price + good food, not luxury." +
-          "\nBe specific with prices, neighborhoods, and booking links when available." +
-          "\nIf the user only said '/hotels' without details, ask them: destination, number of days, budget per night, and food budget per meal."
-      );
-    }
   }
 
   parts.push(

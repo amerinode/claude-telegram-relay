@@ -1,13 +1,14 @@
 /**
  * Smart Check-in — Proactive Assistant Pipeline
  *
- * Runs hourly on weekdays (9am-5pm), noon on weekends (via PM2). Seven sections + meta-layer:
+ * Runs every 30 minutes (via PM2 or cron). Seven sections + meta-layer:
  *   1. Hospitable (Airbnb) — unread guest messages, urgency classification, draft replies
  *   2. Ona Task List — autonomous task execution from "Ona" list
  *   3. My Task List — Gil's tasks: overdue, due today, high importance
  *   4. My Emails — new unread emails from the last 6 hours
  *   5. My Calendar — today's & tomorrow's events, upcoming meetings, RSVP needed
- *   6. Proactive — Claude analyzes all context and suggests actions if warranted
+ *   6. WhatsApp — unread messages with draft replies
+ *   7. Proactive — Claude analyzes all context and suggests actions if warranted
  *
  * Meta-layer: gathers recent messages, memory, and calendar before running sections,
  * feeds all results to Section 7 for holistic analysis. Only reaches out if something
@@ -35,9 +36,11 @@ import {
   type CalendarEvent,
 } from "../src/ms365.ts";
 import { processFileActions } from "../src/file-gen.ts";
+import { createMeetingPage, isNotionEnabled } from "../src/notion.ts";
+import { getMeetingTranscript } from "../src/ms365.ts";
 import { needsSearch, searchWeb } from "../src/search.ts";
 import { getMemoryContext, getRecentHistory } from "../src/memory.ts";
-
+import { isWhatsAppEnabled, isWhatsAppConnected } from "../src/whatsapp.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -65,6 +68,7 @@ async function saveAlertToMessages(content: string, metadata?: Record<string, un
 }
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const USER_NAME = process.env.USER_NAME || "Gil";
+const WA_BRIDGE_PORT = process.env.WHATSAPP_BRIDGE_PORT || "7150";
 const STATE_FILE =
   process.env.CHECKIN_STATE_FILE ||
   join(
@@ -79,11 +83,42 @@ const STATE_FILE =
 
 type UrgencyTier = "critical" | "high" | "medium" | "low";
 
+interface AlertedEntry {
+  /** ISO timestamp of the last guest message we alerted about */
+  lastGuestMessageAt: string;
+  /** When we sent the alert */
+  alertedAt: string;
+}
+
+interface TaskAlertedEntry {
+  /** Task status when we last alerted */
+  status: string;
+  /** When we sent the alert */
+  alertedAt: string;
+}
+
 interface OnaExecutionEntry {
   /** When Ona processed this task */
   executedAt: string;
   /** Whether it was completed or skipped */
   result: "completed" | "skipped" | "failed";
+}
+
+interface EmailAlertedEntry {
+  /** When we alerted about this email */
+  alertedAt: string;
+}
+
+interface CalendarAlertedEntry {
+  /** When we alerted about this calendar event */
+  alertedAt: string;
+}
+
+interface NotionSyncedEntry {
+  /** When we synced this meeting to Notion */
+  syncedAt: string;
+  /** Notion page ID */
+  pageId: string;
 }
 
 /** Accumulates section results for the Proactive analysis layer */
@@ -93,11 +128,18 @@ interface SectionResults {
   myTasks: { alertsSent: number; summary: string };
   myEmails: { alertsSent: number; summary: string };
   myCalendar: { alertsSent: number; summary: string; events: CalendarEvent[] };
+  notionSync: { syncedCount: number; summary: string };
+  whatsapp: { alertsSent: number; summary: string };
 }
 
 interface CheckinState {
   lastRunTime: string;
+  alertedConversations: Record<string, AlertedEntry>;
+  alertedTasks: Record<string, TaskAlertedEntry>;
+  alertedEmails: Record<string, EmailAlertedEntry>;
   onaExecutedTasks: Record<string, OnaExecutionEntry>;
+  alertedCalendarEvents: Record<string, CalendarAlertedEntry>;
+  notionSyncedMeetings: Record<string, NotionSyncedEntry>;
   lastProactiveAt: string;
 }
 
@@ -148,6 +190,20 @@ type Inquiry = {
   lastMessageAt: string;
 };
 
+// WhatsApp bridge message type
+interface WABridgeMessage {
+  id: string;
+  from: string;
+  fromName: string;
+  text: string;
+  timestamp: number;
+  isRead: boolean;
+  isGroup?: boolean;
+  groupName?: string;
+  participant?: string;
+  participantName?: string;
+}
+
 // ============================================================
 // STATE MANAGEMENT
 // ============================================================
@@ -158,13 +214,23 @@ async function loadState(): Promise<CheckinState> {
     const parsed = JSON.parse(content);
     return {
       lastRunTime: parsed.lastRunTime || "",
+      alertedConversations: parsed.alertedConversations || {},
+      alertedTasks: parsed.alertedTasks || {},
+      alertedEmails: parsed.alertedEmails || {},
       onaExecutedTasks: parsed.onaExecutedTasks || {},
+      alertedCalendarEvents: parsed.alertedCalendarEvents || {},
+      notionSyncedMeetings: parsed.notionSyncedMeetings || {},
       lastProactiveAt: parsed.lastProactiveAt || "",
     };
   } catch {
     return {
       lastRunTime: "",
+      alertedConversations: {},
+      alertedTasks: {},
+      alertedEmails: {},
       onaExecutedTasks: {},
+      alertedCalendarEvents: {},
+      notionSyncedMeetings: {},
       lastProactiveAt: "",
     };
   }
@@ -174,89 +240,41 @@ async function saveState(state: CheckinState): Promise<void> {
   await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-/** Remove old Ona execution entries (>30d) */
+/** Remove old entries: conversations >7d, tasks >7d, Ona executions >30d */
 function pruneState(state: CheckinState): void {
+  const convCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  for (const [id, entry] of Object.entries(state.alertedConversations)) {
+    if (new Date(entry.alertedAt).getTime() < convCutoff) {
+      delete state.alertedConversations[id];
+    }
+  }
+
+  const taskCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  for (const [id, entry] of Object.entries(state.alertedTasks)) {
+    if (new Date(entry.alertedAt).getTime() < taskCutoff) {
+      delete state.alertedTasks[id];
+    }
+  }
+
+  const emailCutoff = Date.now() - 48 * 60 * 60 * 1000; // 48h
+  for (const [id, entry] of Object.entries(state.alertedEmails)) {
+    if (new Date(entry.alertedAt).getTime() < emailCutoff) {
+      delete state.alertedEmails[id];
+    }
+  }
+
   const onaCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
   for (const [id, entry] of Object.entries(state.onaExecutedTasks)) {
     if (new Date(entry.executedAt).getTime() < onaCutoff) {
       delete state.onaExecutedTasks[id];
     }
   }
-}
 
-// ============================================================
-// ALERT DEDUP (Supabase)
-// ============================================================
-
-/** Check if an item was already alerted today (in user's timezone) */
-async function wasAlertedToday(alertType: string, itemKey: string): Promise<boolean> {
-  if (!supabase) return false;
-  try {
-    const { data, error } = await supabase
-      .from("alert_dedup")
-      .select("id")
-      .eq("alert_date", todayDateStr())
-      .eq("alert_type", alertType)
-      .eq("item_key", itemKey)
-      .limit(1);
-    if (error) {
-      console.error(`alert_dedup check failed (${alertType}/${itemKey}):`, error.message);
-      return false;
+  const calCutoff = Date.now() - 24 * 60 * 60 * 1000; // 24h
+  for (const [id, entry] of Object.entries(state.alertedCalendarEvents)) {
+    if (new Date(entry.alertedAt).getTime() < calCutoff) {
+      delete state.alertedCalendarEvents[id];
     }
-    return (data?.length ?? 0) > 0;
-  } catch (e: any) {
-    console.error(`alert_dedup check error:`, e.message);
-    return false;
-  }
-}
-
-/** Mark an item as alerted for today. Safe to call multiple times (upsert). */
-async function markAlerted(alertType: string, itemKey: string, metadata?: Record<string, unknown>): Promise<void> {
-  if (!supabase) return;
-  try {
-    const { error } = await supabase
-      .from("alert_dedup")
-      .upsert(
-        { alert_date: todayDateStr(), alert_type: alertType, item_key: itemKey, metadata: metadata || {} },
-        { onConflict: "alert_date,alert_type,item_key" }
-      );
-    if (error) {
-      console.error(`markAlerted failed (${alertType}/${itemKey}):`, error.message);
-    }
-  } catch (e: any) {
-    console.error(`markAlerted error:`, e.message);
-  }
-}
-
-/** Batch check: returns Set of item_keys that have already been alerted today */
-async function batchWasAlertedToday(alertType: string, itemKeys: string[]): Promise<Set<string>> {
-  if (!supabase || !itemKeys.length) return new Set();
-  try {
-    const { data, error } = await supabase
-      .from("alert_dedup")
-      .select("item_key")
-      .eq("alert_date", todayDateStr())
-      .eq("alert_type", alertType)
-      .in("item_key", itemKeys);
-    if (error) {
-      console.error(`batchWasAlertedToday failed (${alertType}):`, error.message);
-      return new Set();
-    }
-    return new Set((data || []).map((r: any) => r.item_key));
-  } catch (e: any) {
-    console.error(`batchWasAlertedToday error:`, e.message);
-    return new Set();
-  }
-}
-
-/** Delete alert_dedup rows older than 7 days */
-async function cleanupOldAlerts(): Promise<void> {
-  if (!supabase) return;
-  try {
-    const { error } = await supabase.rpc("cleanup_old_alerts");
-    if (error) console.error("cleanup_old_alerts failed:", error.message);
-  } catch (e: any) {
-    console.error("cleanup_old_alerts error:", e.message);
   }
 }
 
@@ -516,7 +534,7 @@ function formatAlert(conv: UnansweredConversation, draft: string): string {
 // SECTION 1: HOSPITABLE GUEST ALERTS
 // ============================================================
 
-async function checkHospitableGuests(): Promise<{ count: number; summary: string }> {
+async function checkHospitableGuests(state: CheckinState): Promise<{ count: number; summary: string }> {
   // Dynamically import hospitable (only if configured)
   const {
     listProperties,
@@ -592,7 +610,8 @@ async function checkHospitableGuests(): Promise<{ count: number; summary: string
       const lastGuestMsgTime = lastMsg.createdAt;
       const ageMinutes = (now - new Date(lastGuestMsgTime).getTime()) / 60000;
 
-      if (await wasAlertedToday("guest", `${res.id}:${lastGuestMsgTime}`)) continue;
+      const alerted = state.alertedConversations[res.id];
+      if (alerted && alerted.lastGuestMessageAt === lastGuestMsgTime) continue;
 
       const { tier, label } = classifyUrgency("reservation", res.status, ageMinutes);
       if (tier === "low") continue;
@@ -634,7 +653,8 @@ async function checkHospitableGuests(): Promise<{ count: number; summary: string
       const lastGuestMsgTime = lastMsg.createdAt;
       const ageMinutes = (now - new Date(lastGuestMsgTime).getTime()) / 60000;
 
-      if (await wasAlertedToday("guest", `${inq.id}:${lastGuestMsgTime}`)) continue;
+      const alerted = state.alertedConversations[inq.id];
+      if (alerted && alerted.lastGuestMessageAt === lastGuestMsgTime) continue;
 
       const { tier, label } = classifyUrgency("inquiry", "inquiry", ageMinutes);
       if (tier === "low") continue;
@@ -694,8 +714,10 @@ async function checkHospitableGuests(): Promise<{ count: number; summary: string
         const lastGuestMsg = conv.messages
           .filter((m) => m.senderType !== "host")
           .pop();
-        const guestMsgTime = lastGuestMsg?.createdAt || conv.lastMessageAt;
-        await markAlerted("guest", `${conv.id}:${guestMsgTime}`, { guestName: conv.guestName, property: conv.propertyName });
+        state.alertedConversations[conv.id] = {
+          lastGuestMessageAt: lastGuestMsg?.createdAt || conv.lastMessageAt,
+          alertedAt: new Date().toISOString(),
+        };
         console.log(`  Alert sent for ${conv.guestName}`);
       } else {
         console.error(`  Failed to send alert for ${conv.guestName}`);
@@ -721,7 +743,7 @@ async function checkHospitableGuests(): Promise<{ count: number; summary: string
 // SECTION 2: EMAIL ALERTS
 // ============================================================
 
-async function checkNewEmails(): Promise<{ count: number; summary: string }> {
+async function checkNewEmails(state: CheckinState): Promise<{ count: number; summary: string }> {
   // Fetch recent emails (last 15)
   const emails = await listEmails(15);
   if (!emails.length) {
@@ -731,13 +753,12 @@ async function checkNewEmails(): Promise<{ count: number; summary: string }> {
 
   // Filter: only unread, received in the last 6 hours, not already alerted
   const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000;
-  const candidateEmails = emails.filter((e) => {
+  const newUnread = emails.filter((e) => {
     if (e.isRead) return false;
     if (new Date(e.receivedAt).getTime() < sixHoursAgo) return false;
+    if (state.alertedEmails[e.id]) return false;
     return true;
   });
-  const alreadyAlertedEmails = await batchWasAlertedToday("email", candidateEmails.map(e => e.id));
-  const newUnread = candidateEmails.filter(e => !alreadyAlertedEmails.has(e.id));
 
   if (!newUnread.length) {
     console.log("No new unread emails to alert about.");
@@ -777,8 +798,9 @@ async function checkNewEmails(): Promise<{ count: number; summary: string }> {
 
   if (sent) {
     await saveAlertToMessages(message, { type: "email-alert" });
+    const now = new Date().toISOString();
     for (const email of newUnread) {
-      await markAlerted("email", email.id, { subject: email.subject, from: email.from });
+      state.alertedEmails[email.id] = { alertedAt: now };
     }
     console.log(`Email alert sent: ${toShow.length} emails shown.`);
   }
@@ -793,7 +815,7 @@ async function checkNewEmails(): Promise<{ count: number; summary: string }> {
 // SECTION 3: GIL'S TASK ALERTS
 // ============================================================
 
-async function checkGilTasks(): Promise<{ count: number; summary: string }> {
+async function checkGilTasks(state: CheckinState): Promise<{ count: number; summary: string }> {
   const today = todayDateStr();
   const allLists = await listTaskLists();
 
@@ -834,8 +856,15 @@ async function checkGilTasks(): Promise<{ count: number; summary: string }> {
 
       if (!alertReason) continue;
 
-      // Skip if already alerted today (once per calendar day)
-      if (await wasAlertedToday("task", taskKey)) continue;
+      // Skip if recently alerted and status unchanged
+      // Due-today/overdue: re-alert every 6h so they surface morning + afternoon
+      // High-priority (no due date): re-alert every 24h
+      const existing = state.alertedTasks[taskKey];
+      if (existing) {
+        const hoursSince = (Date.now() - new Date(existing.alertedAt).getTime()) / 3600000;
+        const suppressHours = (alertReason === "Due today" || alertReason === "Overdue") ? 6 : 24;
+        if (hoursSince < suppressHours && existing.status === task.status) continue;
+      }
 
       // Format task line for consolidated report
       const duePart = task.dueDateTime ? ` (due ${fmtDate(task.dueDateTime)})` : "";
@@ -883,8 +912,9 @@ async function checkGilTasks(): Promise<{ count: number; summary: string }> {
   const sent = await sendTelegram(message);
   if (sent) {
     await saveAlertToMessages(message, { type: "task-alert" });
+    const now = new Date().toISOString();
     for (const { key, status } of taskKeysToUpdate) {
-      await markAlerted("task", key, { status });
+      state.alertedTasks[key] = { status, alertedAt: now };
     }
   }
 
@@ -1261,7 +1291,7 @@ async function processOnaTasks(state: CheckinState): Promise<{ count: number; su
 // SECTION 5: MY CALENDAR
 // ============================================================
 
-async function checkCalendar(): Promise<{ count: number; summary: string; events: CalendarEvent[] }> {
+async function checkCalendar(state: CheckinState): Promise<{ count: number; summary: string; events: CalendarEvent[] }> {
   const tz = process.env.USER_TIMEZONE || "America/Sao_Paulo";
   const now = new Date();
 
@@ -1306,17 +1336,9 @@ async function checkCalendar(): Promise<{ count: number; summary: string; events
     e.status !== "accepted" && e.status !== "organizer" && e.status !== "none"
   );
 
-  // Batch check which calendar events were already alerted today
-  const allCalendarKeys = [
-    ...startingSoon.map(e => e.id),
-    ...upcoming.filter(e => !startingSoon.includes(e)).map(e => e.id),
-    ...needsRsvp.map(e => `rsvp:${e.id}`),
-  ];
-  const calAlerted = await batchWasAlertedToday("calendar", allCalendarKeys);
-
-  // Build alert lines — only for items not already alerted today
+  // Build alert lines — only for items not already alerted
   for (const event of startingSoon) {
-    if (!calAlerted.has(event.id)) {
+    if (!state.alertedCalendarEvents[event.id]) {
       const startTime = new Date(event.start).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: tz });
       const minutesAway = Math.round((new Date(event.start).getTime() - nowMs) / 60000);
       const link = event.isOnline && event.onlineUrl ? ` \u2014 ${event.onlineUrl}` : event.isOnline ? " [Online]" : "";
@@ -1327,7 +1349,7 @@ async function checkCalendar(): Promise<{ count: number; summary: string; events
   }
 
   for (const event of upcoming) {
-    if (!startingSoon.includes(event) && !calAlerted.has(event.id)) {
+    if (!startingSoon.includes(event) && !state.alertedCalendarEvents[event.id]) {
       const startTime = new Date(event.start).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: tz });
       const minutesAway = Math.round((new Date(event.start).getTime() - nowMs) / 60000);
       const link = event.isOnline && event.onlineUrl ? ` \u2014 ${event.onlineUrl}` : event.isOnline ? " [Online]" : "";
@@ -1337,7 +1359,7 @@ async function checkCalendar(): Promise<{ count: number; summary: string; events
   }
 
   for (const event of needsRsvp) {
-    if (!calAlerted.has(`rsvp:${event.id}`)) {
+    if (!state.alertedCalendarEvents[`rsvp:${event.id}`]) {
       const day = todayEvents.includes(event) ? "Today" : "Tomorrow";
       const startTime = new Date(event.start).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: tz });
       alertLines.push(`\u2753 Needs RSVP (${day}): ${event.subject} at ${startTime} (${event.status})`);
@@ -1352,8 +1374,9 @@ async function checkCalendar(): Promise<{ count: number; summary: string; events
     const sent = await sendTelegram(message);
     if (sent) {
       await saveAlertToMessages(message, { type: "calendar-alert" });
+      const nowIso = new Date().toISOString();
       for (const id of alertedIds) {
-        await markAlerted("calendar", id);
+        state.alertedCalendarEvents[id] = { alertedAt: nowIso };
       }
       alertsSent = alertLines.length;
     }
@@ -1385,7 +1408,365 @@ async function checkCalendar(): Promise<{ count: number; summary: string; events
   return { count: alertsSent, summary: summaryParts.join(" "), events: allEvents };
 }
 
-// SECTION 6: PROACTIVE ANALYSIS
+// ============================================================
+// SECTION 5.5: POST-MEETING NOTION SYNC
+// ============================================================
+
+/**
+ * After Teams meetings end, fetch transcripts and push summaries to Notion.
+ * Only processes meetings that:
+ *   - Are Teams meetings (online with join URL)
+ *   - Ended more than 10 minutes ago (transcript needs processing time)
+ *   - Haven't been synced to Notion yet (tracked in state)
+ */
+async function syncMeetingsToNotion(
+  state: CheckinState,
+  calendarEvents: CalendarEvent[],
+): Promise<{ count: number; summary: string }> {
+  if (!isNotionEnabled()) {
+    return { count: 0, summary: "Notion not configured." };
+  }
+
+  const tz = process.env.USER_TIMEZONE || "America/Sao_Paulo";
+  const now = Date.now();
+  const TEN_MIN = 10 * 60 * 1000;
+
+  // Filter: Teams meetings that ended 10+ min ago and not yet synced
+  const endedMeetings = calendarEvents.filter(e => {
+    if (!e.isOnline || !e.onlineUrl) return false;
+    const endMs = new Date(e.end).getTime();
+    if (endMs > now - TEN_MIN) return false; // too recent, transcript may not be ready
+    if (state.notionSyncedMeetings[e.id]) return false; // already synced
+    return true;
+  });
+
+  if (!endedMeetings.length) {
+    return { count: 0, summary: "No new ended meetings to sync." };
+  }
+
+  let synced = 0;
+  const summaryParts: string[] = [];
+
+  for (const event of endedMeetings) {
+    try {
+      console.log(`Fetching transcript for: ${event.subject}`);
+      const transcript = await getMeetingTranscript(event.onlineUrl!, event.subject);
+
+      if (!transcript) {
+        console.log(`No transcript available for: ${event.subject}`);
+        summaryParts.push(`${event.subject}: no transcript`);
+        continue;
+      }
+
+      // Use Claude to summarize the transcript
+      const summaryPrompt = [
+        "Summarize this Teams meeting transcript concisely. Return EXACTLY this format (no markdown, no extra text):",
+        "",
+        "SUMMARY:",
+        "(2-4 sentences covering key topics discussed)",
+        "",
+        "ACTION ITEMS:",
+        "(bulleted list of tasks assigned, with names if mentioned)",
+        "",
+        "DECISIONS:",
+        "(bulleted list of decisions made)",
+        "",
+        "If any section has nothing, write 'None'.",
+        "",
+        `Meeting: ${event.subject}`,
+        `Organizer: ${event.organizer}`,
+        "",
+        "TRANSCRIPT:",
+        transcript,
+      ].join("\n");
+
+      const claudeSummary = await callClaudeForSummary(summaryPrompt);
+
+      // Parse Claude's response
+      const summaryMatch = claudeSummary.match(/SUMMARY:\s*([\s\S]*?)(?=ACTION ITEMS:|$)/i);
+      const actionsMatch = claudeSummary.match(/ACTION ITEMS:\s*([\s\S]*?)(?=DECISIONS:|$)/i);
+      const decisionsMatch = claudeSummary.match(/DECISIONS:\s*([\s\S]*?)$/i);
+
+      // Calculate duration
+      const startMs = new Date(event.start).getTime();
+      const endMs = new Date(event.end).getTime();
+      const durationMin = Math.round((endMs - startMs) / 60000);
+      const durationStr = durationMin >= 60
+        ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}min`
+        : `${durationMin} min`;
+
+      // Push to Notion
+      const page = await createMeetingPage({
+        subject: event.subject,
+        date: event.start,
+        endDate: event.end,
+        organizer: event.organizer,
+        duration: durationStr,
+        summary: summaryMatch?.[1]?.trim() || "Meeting transcript processed.",
+        actionItems: actionsMatch?.[1]?.trim() || "None",
+        decisions: decisionsMatch?.[1]?.trim() || "None",
+        fullTranscript: transcript,
+      });
+
+      // Mark as synced
+      state.notionSyncedMeetings[event.id] = {
+        syncedAt: new Date().toISOString(),
+        pageId: page.id,
+      };
+
+      // Notify user
+      const timeStr = new Date(event.start).toLocaleTimeString("en-US", {
+        hour: "2-digit", minute: "2-digit", timeZone: tz,
+      });
+      const msg = `📝 Meeting notes synced to Notion\n\n${event.subject} (${timeStr})\nDuration: ${durationStr}\n\n${summaryMatch?.[1]?.trim().substring(0, 200) || "Summary available in Notion."}`;
+      await sendTelegram(msg);
+      await saveAlertToMessages(msg, { type: "notion-sync", meetingSubject: event.subject });
+
+      synced++;
+      summaryParts.push(`${event.subject}: synced ✅`);
+      console.log(`Synced to Notion: ${event.subject} → ${page.id}`);
+    } catch (error: any) {
+      console.error(`Notion sync failed for "${event.subject}":`, error.message);
+      summaryParts.push(`${event.subject}: error — ${error.message}`);
+    }
+  }
+
+  return {
+    count: synced,
+    summary: summaryParts.length ? summaryParts.join("; ") : "No meetings synced.",
+  };
+}
+
+/**
+ * Call Claude CLI to summarize a transcript.
+ * Lightweight call — no MCP, no tools, just text in/out.
+ */
+async function callClaudeForSummary(prompt: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = nodeSpawn(CLAUDE_PATH, [
+      "--print",
+      "--max-turns", "1",
+      "--model", "sonnet",
+      "-p", prompt,
+    ], {
+      cwd: PROJECT_ROOT,
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "cli" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.on("close", (code: number | null) => {
+      if (code !== 0) {
+        reject(new Error(`Claude exited ${code}: ${stderr.substring(0, 200)}`));
+      } else {
+        resolve(stdout.trim());
+      }
+    });
+    child.on("error", reject);
+  });
+}
+
+// ============================================================
+// SECTION 6: WHATSAPP UNREAD MESSAGES
+// ============================================================
+
+/** Fetch unread WhatsApp messages from the bridge and draft replies via Claude */
+async function checkWhatsApp(state: CheckinState): Promise<{ count: number; summary: string }> {
+  // Check if WhatsApp is enabled and connected
+  if (!isWhatsAppEnabled()) {
+    return { count: 0, summary: "WhatsApp not enabled." };
+  }
+
+  const connected = await isWhatsAppConnected().catch(() => false);
+  if (!connected) {
+    console.log("WhatsApp bridge not connected.");
+    return { count: 0, summary: "WhatsApp bridge not connected." };
+  }
+
+  // Fetch unread messages from the bridge
+  let unreadMessages: WABridgeMessage[] = [];
+  try {
+    const resp = await fetch(`http://127.0.0.1:${WA_BRIDGE_PORT}/messages`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) {
+      console.log(`WhatsApp bridge returned ${resp.status}`);
+      return { count: 0, summary: "WhatsApp bridge error." };
+    }
+    const data = await resp.json() as { messages: WABridgeMessage[] };
+    unreadMessages = (data.messages || []).filter(m => !m.isRead);
+  } catch (error: any) {
+    console.error("Failed to fetch WhatsApp messages:", error.message);
+    return { count: 0, summary: `Error fetching WhatsApp: ${error.message}` };
+  }
+
+  if (!unreadMessages.length) {
+    console.log("No unread WhatsApp messages.");
+    return { count: 0, summary: "No unread WhatsApp messages." };
+  }
+
+  // Group messages by sender (JID)
+  const grouped = new Map<string, { name: string; jid: string; isGroup: boolean; groupName?: string; messages: WABridgeMessage[] }>();
+  for (const msg of unreadMessages) {
+    const key = msg.from;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        name: msg.isGroup ? (msg.groupName || msg.fromName) : msg.fromName,
+        jid: msg.from,
+        isGroup: !!msg.isGroup,
+        groupName: msg.groupName,
+        messages: [],
+      });
+    }
+    grouped.get(key)!.messages.push(msg);
+  }
+
+  console.log(`Found ${unreadMessages.length} unread WhatsApp messages from ${grouped.size} conversations.`);
+
+  const tz = process.env.USER_TIMEZONE || "America/Sao_Paulo";
+
+  // Format conversation context for Claude to draft replies
+  const conversationBlocks: string[] = [];
+  for (const [, conv] of grouped) {
+    const label = conv.isGroup ? `Group: ${conv.groupName || conv.name}` : conv.name;
+    const msgLines = conv.messages.map(m => {
+      const time = new Date(m.timestamp * 1000).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: tz });
+      const sender = conv.isGroup && m.participantName ? `${m.participantName}: ` : "";
+      return `  [${time}] ${sender}${m.text}`;
+    }).join("\n");
+    conversationBlocks.push(`${label} [${conv.jid}]:\n${msgLines}`);
+  }
+
+  const allConversationsText = conversationBlocks.join("\n\n");
+
+  // Spawn Claude to draft replies
+  let drafts = "";
+  try {
+    let profileContext = "";
+    try {
+      profileContext = await readFile(join(PROJECT_ROOT, "config", "profile.md"), "utf-8");
+    } catch {}
+
+    const now = new Date();
+    const timeStr = now.toLocaleString("en-US", {
+      timeZone: tz,
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    const draftPrompt = `You are Ona, ${USER_NAME}'s personal AI assistant. You need to summarize unread WhatsApp messages and suggest draft replies.
+
+CURRENT TIME: ${timeStr}
+
+${profileContext ? `ABOUT ${USER_NAME.toUpperCase()}:\n${profileContext}\n` : ""}
+UNREAD WHATSAPP MESSAGES:
+${allConversationsText}
+
+INSTRUCTIONS:
+1. For each conversation, write a brief summary of what the person/group is saying.
+2. For each conversation that expects a reply, suggest a SHORT draft reply (1-3 sentences).
+3. Match the language the person used (Portuguese or English).
+4. Use ${USER_NAME}'s communication style — warm, direct, friendly.
+5. For group chats, only suggest a reply if ${USER_NAME} was directly addressed or the topic is relevant.
+6. Include the JID in your draft so the user can say "send it" and the relay knows where to send.
+7. Format each conversation like:
+
+📱 **Name** (N messages)
+Summary of what they said.
+💬 Draft: "Your suggested reply"
+(JID: the_jid_here)
+
+8. Be concise. No preamble.`;
+
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.CLAUDECODE;
+    delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+
+    const claudeArgs = ["--no-session-persistence", "--output-format", "text"];
+    const promptFile = join(PROJECT_ROOT, `temp_whatsapp_${Date.now()}.txt`);
+    await writeFile(promptFile, draftPrompt);
+
+    drafts = await new Promise<string>((resolve) => {
+      const child = nodeSpawn(CLAUDE_PATH, claudeArgs, {
+        cwd: PROJECT_ROOT,
+        env: cleanEnv,
+        stdio: ["pipe", "pipe", "pipe"],
+        shell: process.platform === "win32",
+      });
+
+      let output = "";
+      child.stdout?.on("data", (d: Buffer) => { output += d.toString(); });
+      child.stderr?.on("data", () => {});
+
+      const timeout = setTimeout(() => {
+        child.kill("SIGTERM");
+        unlink(promptFile).catch(() => {});
+        resolve("");
+      }, 180_000); // 3 min timeout
+
+      const fs = require("fs");
+      fs.createReadStream(promptFile).pipe(child.stdin!);
+
+      child.on("close", () => {
+        clearTimeout(timeout);
+        unlink(promptFile).catch(() => {});
+        resolve(output.trim());
+      });
+
+      child.on("error", () => {
+        clearTimeout(timeout);
+        unlink(promptFile).catch(() => {});
+        resolve("");
+      });
+    });
+  } catch (error: any) {
+    console.error("WhatsApp draft generation failed:", error.message);
+  }
+
+  // Build Telegram alert
+  const alertParts: string[] = [
+    `📱 WhatsApp — ${unreadMessages.length} unread message${unreadMessages.length > 1 ? "s" : ""} from ${grouped.size} conversation${grouped.size > 1 ? "s" : ""}`,
+    ``,
+  ];
+
+  if (drafts) {
+    alertParts.push(drafts);
+  } else {
+    // Fallback: just list the conversations without drafts
+    for (const [, conv] of grouped) {
+      const label = conv.isGroup ? `Group: ${conv.groupName || conv.name}` : conv.name;
+      const lastMsg = conv.messages[conv.messages.length - 1];
+      const preview = lastMsg.text.substring(0, 100).replace(/\n/g, " ");
+      alertParts.push(`• ${label}: "${preview}${lastMsg.text.length > 100 ? "..." : ""}"`);
+    }
+    alertParts.push(``);
+    alertParts.push(`➡ Tell me to reply to any of these.`);
+  }
+
+  const message = alertParts.join("\n");
+  const sent = await sendTelegram(message);
+  if (sent) {
+    await saveAlertToMessages(message, { type: "whatsapp-alert" });
+  }
+
+  // Build summary for proactive layer
+  const summaryNames = Array.from(grouped.values()).map(c =>
+    `${c.isGroup ? "Group:" : ""} ${c.name} (${c.messages.length} msgs)`
+  ).join("; ");
+  const summary = `${unreadMessages.length} unread WhatsApp messages from: ${summaryNames}`;
+
+  return { count: sent ? grouped.size : 0, summary };
+}
+
+// ============================================================
+// SECTION 7: PROACTIVE ANALYSIS
 // ============================================================
 
 async function runProactiveAnalysis(
@@ -1441,6 +1822,7 @@ async function runProactiveAnalysis(
   contextSections.push(`MY TASKS: ${results.myTasks.summary}`);
   contextSections.push(`MY EMAILS: ${results.myEmails.summary}`);
   contextSections.push(`MY CALENDAR: ${results.myCalendar.summary}`);
+  contextSections.push(`WHATSAPP: ${results.whatsapp.summary}`);
 
   // Include calendar event details for richer analysis
   if (results.myCalendar.events.length) {
@@ -1576,7 +1958,6 @@ async function main() {
 
   const state = await loadState();
   pruneState(state);
-  await cleanupOldAlerts();
 
   // ── Meta-layer: gather context before sections ──
   let recentHistory = "";
@@ -1602,13 +1983,15 @@ async function main() {
     myTasks: { alertsSent: 0, summary: "Skipped (MS365 not enabled)." },
     myEmails: { alertsSent: 0, summary: "Skipped (MS365 not enabled)." },
     myCalendar: { alertsSent: 0, summary: "Skipped (MS365 not enabled).", events: [] },
+    notionSync: { syncedCount: 0, summary: "Skipped (not configured)." },
+    whatsapp: { alertsSent: 0, summary: "Skipped (not enabled)." },
   };
 
   // ── Section 1: Hospitable (Airbnb) ──
   if (process.env.HOSPITABLE_API_TOKEN) {
     console.log("\n--- Section 1: Hospitable (Airbnb) ---");
     try {
-      const { count, summary } = await checkHospitableGuests();
+      const { count, summary } = await checkHospitableGuests(state);
       results.hospitable = { alertsSent: count, summary };
       console.log(`Guest alerts sent: ${count}`);
     } catch (error: any) {
@@ -1634,7 +2017,7 @@ async function main() {
     // ── Section 3: My Task List ──
     console.log("\n--- Section 3: My Tasks ---");
     try {
-      const { count, summary } = await checkGilTasks();
+      const { count, summary } = await checkGilTasks(state);
       results.myTasks = { alertsSent: count, summary };
       console.log(`Task alerts sent: ${count}`);
     } catch (error: any) {
@@ -1645,7 +2028,7 @@ async function main() {
     // ── Section 4: My Emails ──
     console.log("\n--- Section 4: My Emails ---");
     try {
-      const { count, summary } = await checkNewEmails();
+      const { count, summary } = await checkNewEmails(state);
       results.myEmails = { alertsSent: count, summary };
       console.log(`Email alerts sent: ${count}`);
     } catch (error: any) {
@@ -1656,9 +2039,22 @@ async function main() {
     // ── Section 5: My Calendar ──
     console.log("\n--- Section 5: My Calendar ---");
     try {
-      const { count, summary, events } = await checkCalendar();
+      const { count, summary, events } = await checkCalendar(state);
       results.myCalendar = { alertsSent: count, summary, events };
       console.log(`Calendar alerts sent: ${count}`);
+
+      // ── Section 5.5: Notion Meeting Sync ──
+      if (isNotionEnabled()) {
+        console.log("\n--- Section 5.5: Notion Meeting Sync ---");
+        try {
+          const { count: syncCount, summary: syncSummary } = await syncMeetingsToNotion(state, events);
+          results.notionSync = { syncedCount: syncCount, summary: syncSummary };
+          console.log(`Meetings synced to Notion: ${syncCount}`);
+        } catch (error: any) {
+          console.error("Notion sync failed:", error.message);
+          results.notionSync.summary = `Error: ${error.message}`;
+        }
+      }
     } catch (error: any) {
       console.error("Calendar check failed:", error.message);
       results.myCalendar.summary = `Error: ${error.message}`;
@@ -1667,8 +2063,19 @@ async function main() {
     console.log("MS365 not enabled, skipping sections 2-5.");
   }
 
-  // ── Section 6: Proactive Analysis ──
-  console.log("\n--- Section 6: Proactive Analysis ---");
+  // ── Section 6: WhatsApp ──
+  console.log("\n--- Section 6: WhatsApp ---");
+  try {
+    const { count, summary } = await checkWhatsApp(state);
+    results.whatsapp = { alertsSent: count, summary };
+    console.log(`WhatsApp alerts sent: ${count}`);
+  } catch (error: any) {
+    console.error("WhatsApp check failed:", error.message);
+    results.whatsapp.summary = `Error: ${error.message}`;
+  }
+
+  // ── Section 7: Proactive Analysis ──
+  console.log("\n--- Section 7: Proactive Analysis ---");
   try {
     const proactiveAlerts = await runProactiveAnalysis(state, results, recentHistory, memoryContext);
     console.log(`Proactive insights sent: ${proactiveAlerts}`);
