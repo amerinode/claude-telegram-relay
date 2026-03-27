@@ -29,6 +29,7 @@ import {
   declineCalendarEvent,
   sendEmail,
   createDraft,
+  getMeetingTranscript,
 } from "./ms365.ts";
 import {
   handleHospitableRequest,
@@ -36,6 +37,7 @@ import {
   sendInquiryMessage,
   syncTransactionsToSupabase,
 } from "./hospitable.ts";
+import { createMeetingPage, isNotionEnabled } from "./notion.ts";
 import { needsSearch, searchWeb } from "./search.ts";
 import { processFileActions } from "./file-gen.ts";
 import { makeCall, isCallConfigured } from "./call.ts";
@@ -396,6 +398,9 @@ function needsMs365(message: string): boolean {
     /\b(meeting|reunião|call|chamada).{0,15}(notes?|notas?|summary|resumo)\b/i,
     /\b(action items?|follow.?ups?|takeaways?|next steps?)\b.{0,20}\b(from|da|do).{0,15}\b(meeting|call|reunião)\b/i,
     /\b(last|latest|recent|última|último)\b.{0,15}\b(meeting|call|reunião|sync)\b/i,
+    // Notion sync triggers
+    /\b(push|save|sync|send|add)\b.{0,15}\b(to\s+)?notion\b/i,
+    /\bnotion\b.{0,15}\b(sync|push|save|add)\b/i,
   ];
 
   return ms365ActionPatterns.some(p => p.test(message));
@@ -584,6 +589,60 @@ async function processMs365Actions(response: string): Promise<string> {
     } catch (error: any) {
       console.error("Send email error:", error.message);
       clean = clean.replace(match[0], `❌ Could not send email: ${error.message}`);
+    }
+  }
+
+  // [SYNC_TO_NOTION: meeting subject search text]
+  for (const match of response.matchAll(/\[SYNC_TO_NOTION:\s*(.+?)\]/gi)) {
+    if (!isNotionEnabled()) {
+      clean = clean.replace(match[0], `❌ Notion not configured (set NOTION_API_KEY and NOTION_MEETINGS_DB_ID)`);
+      continue;
+    }
+    try {
+      const searchText = match[1].trim();
+      // Find matching meeting from recent calendar
+      const now = new Date();
+      const threeDaysAgo = new Date(now.getTime() - 3 * 86400000).toISOString();
+      const events = await listCalendarEvents(threeDaysAgo, now.toISOString(), 20);
+      const teamsEvents = events.filter(e => e.isOnline && e.onlineUrl);
+      const target = searchText.toLowerCase();
+      const matched = teamsEvents.find(e =>
+        e.subject.toLowerCase().includes(target) ||
+        target.split(/\s+/).filter(w => w.length > 3).some(w => e.subject.toLowerCase().includes(w))
+      );
+
+      if (!matched || !matched.onlineUrl) {
+        clean = clean.replace(match[0], `❌ No Teams meeting found matching "${searchText}"`);
+        continue;
+      }
+
+      const transcript = await getMeetingTranscript(matched.onlineUrl, matched.subject);
+      if (!transcript) {
+        clean = clean.replace(match[0], `❌ No transcript available for "${matched.subject}"`);
+        continue;
+      }
+
+      // Calculate duration
+      const durationMin = Math.round((new Date(matched.end).getTime() - new Date(matched.start).getTime()) / 60000);
+      const durationStr = durationMin >= 60
+        ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}min`
+        : `${durationMin} min`;
+
+      const page = await createMeetingPage({
+        subject: matched.subject,
+        date: matched.start,
+        endDate: matched.end,
+        organizer: matched.organizer,
+        duration: durationStr,
+        summary: "Meeting transcript synced via Ona. Full summary in page body.",
+        fullTranscript: transcript,
+      });
+
+      console.log(`Synced to Notion: ${matched.subject} → ${page.id}`);
+      clean = clean.replace(match[0], `✅ Synced "${matched.subject}" to Notion`);
+    } catch (error: any) {
+      console.error("Notion sync error:", error.message);
+      clean = clean.replace(match[0], `❌ Notion sync failed: ${error.message}`);
     }
   }
 
@@ -925,7 +984,11 @@ function buildPrompt(
         "\nWhen transcript data is included above, summarize the key points, decisions, and action items." +
         "\nIdentify who said what when the user asks about specific speakers." +
         "\nIf the user asks for the full transcript, present it with speaker names and timestamps." +
-        "\nFocus on actionable content: decisions made, tasks assigned, deadlines mentioned."
+        "\nFocus on actionable content: decisions made, tasks assigned, deadlines mentioned." +
+        "\n\nNOTION SYNC:" +
+        "\nWhen the user asks to push/save/sync a meeting to Notion, include this tag:" +
+        "\n[SYNC_TO_NOTION: meeting subject search text]" +
+        "\nThis syncs the transcript summary to their Notion meetings database."
     );
   }
 

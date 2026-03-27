@@ -36,6 +36,8 @@ import {
   type CalendarEvent,
 } from "../src/ms365.ts";
 import { processFileActions } from "../src/file-gen.ts";
+import { createMeetingPage, isNotionEnabled } from "../src/notion.ts";
+import { getMeetingTranscript } from "../src/ms365.ts";
 import { needsSearch, searchWeb } from "../src/search.ts";
 import { getMemoryContext, getRecentHistory } from "../src/memory.ts";
 import { isWhatsAppEnabled, isWhatsAppConnected } from "../src/whatsapp.ts";
@@ -112,6 +114,13 @@ interface CalendarAlertedEntry {
   alertedAt: string;
 }
 
+interface NotionSyncedEntry {
+  /** When we synced this meeting to Notion */
+  syncedAt: string;
+  /** Notion page ID */
+  pageId: string;
+}
+
 /** Accumulates section results for the Proactive analysis layer */
 interface SectionResults {
   hospitable: { alertsSent: number; summary: string };
@@ -119,6 +128,7 @@ interface SectionResults {
   myTasks: { alertsSent: number; summary: string };
   myEmails: { alertsSent: number; summary: string };
   myCalendar: { alertsSent: number; summary: string; events: CalendarEvent[] };
+  notionSync: { syncedCount: number; summary: string };
   whatsapp: { alertsSent: number; summary: string };
 }
 
@@ -129,6 +139,7 @@ interface CheckinState {
   alertedEmails: Record<string, EmailAlertedEntry>;
   onaExecutedTasks: Record<string, OnaExecutionEntry>;
   alertedCalendarEvents: Record<string, CalendarAlertedEntry>;
+  notionSyncedMeetings: Record<string, NotionSyncedEntry>;
   lastProactiveAt: string;
 }
 
@@ -208,6 +219,7 @@ async function loadState(): Promise<CheckinState> {
       alertedEmails: parsed.alertedEmails || {},
       onaExecutedTasks: parsed.onaExecutedTasks || {},
       alertedCalendarEvents: parsed.alertedCalendarEvents || {},
+      notionSyncedMeetings: parsed.notionSyncedMeetings || {},
       lastProactiveAt: parsed.lastProactiveAt || "",
     };
   } catch {
@@ -218,6 +230,7 @@ async function loadState(): Promise<CheckinState> {
       alertedEmails: {},
       onaExecutedTasks: {},
       alertedCalendarEvents: {},
+      notionSyncedMeetings: {},
       lastProactiveAt: "",
     };
   }
@@ -1396,6 +1409,167 @@ async function checkCalendar(state: CheckinState): Promise<{ count: number; summ
 }
 
 // ============================================================
+// SECTION 5.5: POST-MEETING NOTION SYNC
+// ============================================================
+
+/**
+ * After Teams meetings end, fetch transcripts and push summaries to Notion.
+ * Only processes meetings that:
+ *   - Are Teams meetings (online with join URL)
+ *   - Ended more than 10 minutes ago (transcript needs processing time)
+ *   - Haven't been synced to Notion yet (tracked in state)
+ */
+async function syncMeetingsToNotion(
+  state: CheckinState,
+  calendarEvents: CalendarEvent[],
+): Promise<{ count: number; summary: string }> {
+  if (!isNotionEnabled()) {
+    return { count: 0, summary: "Notion not configured." };
+  }
+
+  const tz = process.env.USER_TIMEZONE || "America/Sao_Paulo";
+  const now = Date.now();
+  const TEN_MIN = 10 * 60 * 1000;
+
+  // Filter: Teams meetings that ended 10+ min ago and not yet synced
+  const endedMeetings = calendarEvents.filter(e => {
+    if (!e.isOnline || !e.onlineUrl) return false;
+    const endMs = new Date(e.end).getTime();
+    if (endMs > now - TEN_MIN) return false; // too recent, transcript may not be ready
+    if (state.notionSyncedMeetings[e.id]) return false; // already synced
+    return true;
+  });
+
+  if (!endedMeetings.length) {
+    return { count: 0, summary: "No new ended meetings to sync." };
+  }
+
+  let synced = 0;
+  const summaryParts: string[] = [];
+
+  for (const event of endedMeetings) {
+    try {
+      console.log(`Fetching transcript for: ${event.subject}`);
+      const transcript = await getMeetingTranscript(event.onlineUrl!, event.subject);
+
+      if (!transcript) {
+        console.log(`No transcript available for: ${event.subject}`);
+        summaryParts.push(`${event.subject}: no transcript`);
+        continue;
+      }
+
+      // Use Claude to summarize the transcript
+      const summaryPrompt = [
+        "Summarize this Teams meeting transcript concisely. Return EXACTLY this format (no markdown, no extra text):",
+        "",
+        "SUMMARY:",
+        "(2-4 sentences covering key topics discussed)",
+        "",
+        "ACTION ITEMS:",
+        "(bulleted list of tasks assigned, with names if mentioned)",
+        "",
+        "DECISIONS:",
+        "(bulleted list of decisions made)",
+        "",
+        "If any section has nothing, write 'None'.",
+        "",
+        `Meeting: ${event.subject}`,
+        `Organizer: ${event.organizer}`,
+        "",
+        "TRANSCRIPT:",
+        transcript,
+      ].join("\n");
+
+      const claudeSummary = await callClaudeForSummary(summaryPrompt);
+
+      // Parse Claude's response
+      const summaryMatch = claudeSummary.match(/SUMMARY:\s*([\s\S]*?)(?=ACTION ITEMS:|$)/i);
+      const actionsMatch = claudeSummary.match(/ACTION ITEMS:\s*([\s\S]*?)(?=DECISIONS:|$)/i);
+      const decisionsMatch = claudeSummary.match(/DECISIONS:\s*([\s\S]*?)$/i);
+
+      // Calculate duration
+      const startMs = new Date(event.start).getTime();
+      const endMs = new Date(event.end).getTime();
+      const durationMin = Math.round((endMs - startMs) / 60000);
+      const durationStr = durationMin >= 60
+        ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}min`
+        : `${durationMin} min`;
+
+      // Push to Notion
+      const page = await createMeetingPage({
+        subject: event.subject,
+        date: event.start,
+        endDate: event.end,
+        organizer: event.organizer,
+        duration: durationStr,
+        summary: summaryMatch?.[1]?.trim() || "Meeting transcript processed.",
+        actionItems: actionsMatch?.[1]?.trim() || "None",
+        decisions: decisionsMatch?.[1]?.trim() || "None",
+        fullTranscript: transcript,
+      });
+
+      // Mark as synced
+      state.notionSyncedMeetings[event.id] = {
+        syncedAt: new Date().toISOString(),
+        pageId: page.id,
+      };
+
+      // Notify user
+      const timeStr = new Date(event.start).toLocaleTimeString("en-US", {
+        hour: "2-digit", minute: "2-digit", timeZone: tz,
+      });
+      const msg = `📝 Meeting notes synced to Notion\n\n${event.subject} (${timeStr})\nDuration: ${durationStr}\n\n${summaryMatch?.[1]?.trim().substring(0, 200) || "Summary available in Notion."}`;
+      await sendTelegram(msg);
+      await saveAlertToMessages(msg, { type: "notion-sync", meetingSubject: event.subject });
+
+      synced++;
+      summaryParts.push(`${event.subject}: synced ✅`);
+      console.log(`Synced to Notion: ${event.subject} → ${page.id}`);
+    } catch (error: any) {
+      console.error(`Notion sync failed for "${event.subject}":`, error.message);
+      summaryParts.push(`${event.subject}: error — ${error.message}`);
+    }
+  }
+
+  return {
+    count: synced,
+    summary: summaryParts.length ? summaryParts.join("; ") : "No meetings synced.",
+  };
+}
+
+/**
+ * Call Claude CLI to summarize a transcript.
+ * Lightweight call — no MCP, no tools, just text in/out.
+ */
+async function callClaudeForSummary(prompt: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = nodeSpawn(CLAUDE_PATH, [
+      "--print",
+      "--max-turns", "1",
+      "--model", "sonnet",
+      "-p", prompt,
+    ], {
+      cwd: PROJECT_ROOT,
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "cli" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.on("close", (code: number | null) => {
+      if (code !== 0) {
+        reject(new Error(`Claude exited ${code}: ${stderr.substring(0, 200)}`));
+      } else {
+        resolve(stdout.trim());
+      }
+    });
+    child.on("error", reject);
+  });
+}
+
+// ============================================================
 // SECTION 6: WHATSAPP UNREAD MESSAGES
 // ============================================================
 
@@ -1809,6 +1983,7 @@ async function main() {
     myTasks: { alertsSent: 0, summary: "Skipped (MS365 not enabled)." },
     myEmails: { alertsSent: 0, summary: "Skipped (MS365 not enabled)." },
     myCalendar: { alertsSent: 0, summary: "Skipped (MS365 not enabled).", events: [] },
+    notionSync: { syncedCount: 0, summary: "Skipped (not configured)." },
     whatsapp: { alertsSent: 0, summary: "Skipped (not enabled)." },
   };
 
@@ -1867,6 +2042,19 @@ async function main() {
       const { count, summary, events } = await checkCalendar(state);
       results.myCalendar = { alertsSent: count, summary, events };
       console.log(`Calendar alerts sent: ${count}`);
+
+      // ── Section 5.5: Notion Meeting Sync ──
+      if (isNotionEnabled()) {
+        console.log("\n--- Section 5.5: Notion Meeting Sync ---");
+        try {
+          const { count: syncCount, summary: syncSummary } = await syncMeetingsToNotion(state, events);
+          results.notionSync = { syncedCount: syncCount, summary: syncSummary };
+          console.log(`Meetings synced to Notion: ${syncCount}`);
+        } catch (error: any) {
+          console.error("Notion sync failed:", error.message);
+          results.notionSync.summary = `Error: ${error.message}`;
+        }
+      }
     } catch (error: any) {
       console.error("Calendar check failed:", error.message);
       results.myCalendar.summary = `Error: ${error.message}`;
