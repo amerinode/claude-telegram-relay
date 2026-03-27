@@ -389,6 +389,13 @@ function needsMs365(message: string): boolean {
     /\b(add|put).{0,15}(calendar|my cal)\b/i,
     // Confirm/accept meetings
     /\b(accept|confirm|rsvp|decline)\b.{0,20}\b(meeting|event|invite|calendar)\b/i,
+    // Meeting transcripts
+    /\b(transcript|transcrição|transcription|transcri[çc])\b/i,
+    /\b(what|o que).{0,15}(was|were|foi|foram).{0,15}(discussed|decided|said|talked|falado|decidido|discutido)\b/i,
+    /\b(who|quem).{0,15}(said|falou|disse)\b.{0,20}\b(in|na|no|at|during)\b/i,
+    /\b(meeting|reunião|call|chamada).{0,15}(notes?|notas?|summary|resumo)\b/i,
+    /\b(action items?|follow.?ups?|takeaways?|next steps?)\b.{0,20}\b(from|da|do).{0,15}\b(meeting|call|reunião)\b/i,
+    /\b(last|latest|recent|última|último)\b.{0,15}\b(meeting|call|reunião|sync)\b/i,
   ];
 
   return ms365ActionPatterns.some(p => p.test(message));
@@ -913,7 +920,12 @@ function buildPrompt(
         "\nThese tags are processed automatically — include them in your response along with a human-friendly confirmation." +
         "\nAlways CONFIRM with the user before sending emails or making calendar changes." +
         "\nFor drafts, you can save directly when the user asks — no confirmation needed since it doesn't send anything." +
-        "\nSummarize emails concisely rather than showing raw data."
+        "\nSummarize emails concisely rather than showing raw data." +
+        "\n\nMEETING TRANSCRIPTS:" +
+        "\nWhen transcript data is included above, summarize the key points, decisions, and action items." +
+        "\nIdentify who said what when the user asks about specific speakers." +
+        "\nIf the user asks for the full transcript, present it with speaker names and timestamps." +
+        "\nFocus on actionable content: decisions made, tasks assigned, deadlines mentioned."
     );
   }
 

@@ -44,7 +44,7 @@ async function refreshAccessToken(): Promise<string> {
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
-    scope: "Mail.ReadWrite Mail.Send Calendars.ReadWrite User.Read offline_access",
+    scope: "Mail.ReadWrite Mail.Send Calendars.ReadWrite OnlineMeetingTranscript.Read.All User.Read offline_access",
   });
 
   const resp = await fetch(TOKEN_URL, {
@@ -263,6 +263,231 @@ export async function listCalendarEvents(
   }));
 }
 
+// ============================================================
+// TEAMS MEETING TRANSCRIPTS
+// ============================================================
+
+interface TranscriptInfo {
+  id: string;
+  meetingId: string;
+  createdDateTime: string;
+}
+
+/**
+ * Find the online meeting ID by join URL.
+ * Calendar events have a joinUrl; the transcript API needs the meeting ID.
+ */
+async function getOnlineMeetingByJoinUrl(joinUrl: string): Promise<string | null> {
+  try {
+    const data = await graphRequest("/me/onlineMeetings", {
+      params: {
+        $filter: `JoinWebUrl eq '${joinUrl}'`,
+        $select: "id",
+      },
+    }) as { value: any[] };
+    return data.value?.[0]?.id || null;
+  } catch (e: any) {
+    console.error("Failed to find online meeting:", e.message);
+    return null;
+  }
+}
+
+/**
+ * List transcripts for an online meeting.
+ */
+async function listMeetingTranscripts(onlineMeetingId: string): Promise<TranscriptInfo[]> {
+  const data = await graphRequest(
+    `/me/onlineMeetings/${onlineMeetingId}/transcripts`,
+    { params: { $select: "id,meetingId,createdDateTime" } }
+  ) as { value: any[] };
+
+  return (data.value || []).map((t: any) => ({
+    id: t.id,
+    meetingId: t.meetingId,
+    createdDateTime: t.createdDateTime,
+  }));
+}
+
+/**
+ * Get transcript content as VTT text and parse it into readable format.
+ */
+async function getTranscriptContent(onlineMeetingId: string, transcriptId: string): Promise<string> {
+  const token = await getAccessToken();
+  const url = `${GRAPH_BASE}/me/onlineMeetings/${onlineMeetingId}/transcripts/${transcriptId}/content?$format=text/vtt`;
+
+  const resp = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "text/vtt",
+    },
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Transcript fetch failed (${resp.status}): ${err.substring(0, 300)}`);
+  }
+
+  return resp.text();
+}
+
+/**
+ * Parse VTT transcript into readable speaker/text format.
+ * VTT format:
+ *   WEBVTT
+ *   00:00:00.000 --> 00:00:05.000
+ *   <v Speaker Name>Some text here</v>
+ */
+function parseVtt(vtt: string): Array<{ speaker: string; text: string; time: string }> {
+  const entries: Array<{ speaker: string; text: string; time: string }> = [];
+  const lines = vtt.split("\n");
+
+  let currentTime = "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Timestamp line: 00:00:00.000 --> 00:00:05.000
+    const timeMatch = trimmed.match(/^(\d{2}:\d{2}:\d{2})\.\d+ -->/);
+    if (timeMatch) {
+      currentTime = timeMatch[1];
+      continue;
+    }
+
+    // Speaker line: <v Speaker Name>text</v>
+    const speakerMatch = trimmed.match(/^<v\s+([^>]+)>(.+?)(?:<\/v>)?$/);
+    if (speakerMatch) {
+      entries.push({
+        speaker: speakerMatch[1].trim(),
+        text: speakerMatch[2].trim(),
+        time: currentTime,
+      });
+      continue;
+    }
+
+    // Plain text line (no speaker tag, but has content after a timestamp)
+    if (trimmed && currentTime && !trimmed.startsWith("WEBVTT") && !trimmed.startsWith("NOTE")) {
+      const lastEntry = entries[entries.length - 1];
+      if (lastEntry && lastEntry.time === currentTime) {
+        lastEntry.text += " " + trimmed;
+      } else if (trimmed.length > 1) {
+        entries.push({ speaker: "Unknown", text: trimmed, time: currentTime });
+      }
+    }
+  }
+
+  return entries;
+}
+
+/**
+ * Fetch transcript for a Teams meeting, given the calendar event's join URL.
+ * Returns formatted transcript text or null if no transcript available.
+ */
+export async function getMeetingTranscript(joinUrl: string, subject: string): Promise<string | null> {
+  try {
+    const meetingId = await getOnlineMeetingByJoinUrl(joinUrl);
+    if (!meetingId) {
+      console.log(`No online meeting found for: ${subject}`);
+      return null;
+    }
+
+    const transcripts = await listMeetingTranscripts(meetingId);
+    if (!transcripts.length) {
+      console.log(`No transcripts for meeting: ${subject}`);
+      return null;
+    }
+
+    // Get the most recent transcript
+    const latest = transcripts[transcripts.length - 1];
+    const vttContent = await getTranscriptContent(meetingId, latest.id);
+    const parsed = parseVtt(vttContent);
+
+    if (!parsed.length) return null;
+
+    // Format: consolidate consecutive lines from same speaker
+    const consolidated: Array<{ speaker: string; text: string; time: string }> = [];
+    for (const entry of parsed) {
+      const last = consolidated[consolidated.length - 1];
+      if (last && last.speaker === entry.speaker) {
+        last.text += " " + entry.text;
+      } else {
+        consolidated.push({ ...entry });
+      }
+    }
+
+    // Limit to avoid blowing up context
+    const maxEntries = 60;
+    const limited = consolidated.slice(0, maxEntries);
+    const lines = limited.map(e => `[${e.time}] ${e.speaker}: ${e.text}`);
+    if (consolidated.length > maxEntries) {
+      lines.push(`... (${consolidated.length - maxEntries} more entries truncated)`);
+    }
+
+    return lines.join("\n");
+  } catch (error: any) {
+    console.error(`Transcript error for "${subject}":`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Fetch transcripts for recent Teams meetings.
+ * Gets calendar events, finds ones with Teams, fetches their transcripts.
+ */
+export async function getRecentMeetingTranscripts(
+  startDate?: string,
+  endDate?: string,
+  targetSubject?: string
+): Promise<string> {
+  const events = await listCalendarEvents(startDate, endDate, 20);
+  const teamsEvents = events.filter(e => e.isOnline && e.onlineUrl);
+
+  if (!teamsEvents.length) return "No Teams meetings found for this period.";
+
+  // If asking about a specific meeting, find it
+  if (targetSubject) {
+    const target = targetSubject.toLowerCase();
+    const match = teamsEvents.find(e =>
+      e.subject.toLowerCase().includes(target) ||
+      target.split(/\s+/).filter(w => w.length > 3).some(w => e.subject.toLowerCase().includes(w))
+    );
+    if (match && match.onlineUrl) {
+      const transcript = await getMeetingTranscript(match.onlineUrl, match.subject);
+      if (transcript) {
+        const time = new Date(match.start).toLocaleString("en-US", {
+          timeZone: process.env.USER_TIMEZONE || "America/Sao_Paulo",
+          weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+        });
+        return `MEETING TRANSCRIPT: ${match.subject} (${time})\nOrganizer: ${match.organizer}\n\n${transcript}`;
+      }
+      return `Meeting "${match.subject}" found but no transcript available. Transcription may not have been enabled for this meeting.`;
+    }
+  }
+
+  // List meetings with transcript availability
+  const results: string[] = [];
+  results.push(`TEAMS MEETINGS (${teamsEvents.length}):\n`);
+
+  for (const event of teamsEvents.slice(0, 5)) {
+    const time = new Date(event.start).toLocaleString("en-US", {
+      timeZone: process.env.USER_TIMEZONE || "America/Sao_Paulo",
+      weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    });
+
+    let transcriptStatus = "";
+    if (event.onlineUrl) {
+      const meetingId = await getOnlineMeetingByJoinUrl(event.onlineUrl);
+      if (meetingId) {
+        const transcripts = await listMeetingTranscripts(meetingId);
+        transcriptStatus = transcripts.length > 0 ? " [TRANSCRIPT AVAILABLE]" : " [no transcript]";
+      }
+    }
+
+    results.push(`- ${time}: ${event.subject} (${event.organizer})${transcriptStatus}`);
+  }
+
+  results.push("\nAsk about a specific meeting to see its full transcript.");
+  return results.join("\n");
+}
+
 /**
  * Create a calendar event.
  */
@@ -374,6 +599,44 @@ export async function handleMs365Request(userMessage: string, recentHistory: str
     // First, gather context based on what the user seems to want
     const msg = userMessage.toLowerCase();
     let context = "";
+
+    // Meeting transcripts — check before general calendar to handle transcript-specific requests
+    if (msg.match(/\b(transcript|transcrição|transcription|transcri[çc])/i) ||
+        (msg.match(/\b(what|o que).{0,15}(was|were|foi|foram).{0,15}(discussed|decided|said|talked|falado|decidido|discutido)\b/i)) ||
+        (msg.match(/\b(who|quem).{0,15}(said|falou|disse)\b/i)) ||
+        (msg.match(/\b(meeting|reunião|call).{0,15}(notes?|notas?|summary|resumo)\b/i))) {
+      const isTomorrow = /\b(tomorrow)\b|amanh[aã]/i.test(msg);
+      const isYesterday = /\b(yesterday)\b|ontem/i.test(msg);
+      const isThisWeek = /\b(this week|esta semana)\b/i.test(msg);
+      const now = new Date();
+      let start: string, end: string;
+
+      if (isYesterday) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+        start = d.toISOString();
+        end = new Date(d.getTime() + 86400000).toISOString();
+      } else if (isTomorrow) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+        start = d.toISOString();
+        end = new Date(d.getTime() + 86400000).toISOString();
+      } else if (isThisWeek) {
+        const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+        start = weekStart.toISOString();
+        end = new Date(weekStart.getTime() + 7 * 86400000).toISOString();
+      } else {
+        // Default: last 3 days
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 3).toISOString();
+        end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
+      }
+
+      // Try to extract a specific meeting name from the message
+      let targetSubject: string | undefined;
+      const aboutMatch = msg.match(/(?:about|from|da|do|de|sobre|with|com)\s+(?:the\s+)?(?:meeting\s+(?:with\s+)?)?["']?([^"'?.!]+)/i);
+      if (aboutMatch) targetSubject = aboutMatch[1].trim();
+
+      const transcriptContext = await getRecentMeetingTranscripts(start, end, targetSubject);
+      context += transcriptContext;
+    }
 
     // Fetch relevant data
     if (msg.match(/\b(calendars?|calend[aá]rios?|schedule|meetings?|events?|agenda|appointments?|what'?s on|compromissos?|reuni[aãõo])/i)) {
