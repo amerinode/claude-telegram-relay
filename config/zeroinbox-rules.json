@@ -1,0 +1,144 @@
+{
+  "_comment": "ZeroInbox v2 classification rules — edit these to tune Gil's inbox routing",
+  "_version": "2.0",
+
+  "importantDomains": [
+    "telefonica.com",
+    "timbrasil.com.br",
+    "claro.com.br",
+    "algartelecom.com.br",
+    "vtal.com.br",
+    "tim.com.br",
+    "amerinode.com.br",
+    "amerinode.atlassian.net"
+  ],
+
+  "readSenders": [
+    "mail.anthropic.com"
+  ],
+
+  "spamSenders": [
+    "kevin.robertson",
+    "julia.matthews",
+    "backlinks",
+    "sierra.blake",
+    "taylor.henderson",
+    "derek.hollister",
+    "larknodetech.com"
+  ],
+
+  "safeSenders": [
+    "ellie@skywardtel.com"
+  ],
+
+  "spamKeywords": [
+    "unsubscribe",
+    "click here to unsubscribe",
+    "you've been selected",
+    "you have been selected",
+    "limited time offer",
+    "act now",
+    "open to an exit",
+    "speaking gig",
+    "backlinks",
+    "performance pr",
+    "leads for",
+    "we found leads",
+    "asset recovery"
+  ],
+
+  "subscriptionBodyKeywords": [
+    "Descadastre-se."
+  ],
+
+  "ccDowngradeRules": {
+    "_comment": "Emails where Gil is CC'd (not direct TO) are downgraded in priority",
+    "ccWithMultipleRecipients": {
+      "threshold": 3,
+      "downgradeFrom": "Important",
+      "downgradeTo": "Respond"
+    },
+    "ccBroadcast": {
+      "threshold": 5,
+      "downgradeFrom": "Important",
+      "downgradeTo": "Read"
+    }
+  },
+
+  "threadingRules": {
+    "_comment": "Re: and RES: threads inherit classification from original thread",
+    "subjectPrefixes": ["Re:", "RES:", "Fwd:", "Enc:"],
+    "inheritClassification": true,
+    "defaultIfThreadUnknown": "Important"
+  },
+
+  "urgencyEscalation": {
+    "_comment": "These keywords in subject or body flag the email with ⚡ and prioritize within Important",
+    "keywords": ["URGENTE", "URGENT", "EMERGENCIAL", "CRITICAL", "URGENCY", "EMERGENCIA"],
+    "flag": "⚡",
+    "targetFolder": "Important"
+  },
+
+  "transactionalPatterns": {
+    "_comment": "Emails from customer domains matching these patterns go to Read, not Important",
+    "subjectKeywords": [
+      "Pedido",
+      "Confirmação do Pedido",
+      "Order #",
+      "Invoice",
+      "NF-e",
+      "Nota Fiscal",
+      "Fatura",
+      "Comprovante",
+      "Recibo",
+      "Boleto"
+    ],
+    "targetFolder": "Read"
+  },
+
+  "automatedSenderPrefixes": {
+    "_comment": "Senders with these prefixes go to Subscription/Read — never Important, even if domain matches",
+    "prefixes": [
+      "noreply@",
+      "no-reply@",
+      "atendimento@",
+      "notification@",
+      "donotreply@",
+      "fatura@",
+      "billing@",
+      "notificacao@",
+      "avisos@",
+      "alertas@",
+      "suporte@",
+      "helpdesk@"
+    ],
+    "targetFolder": "Subscription"
+  },
+
+  "unknownSenderFallback": {
+    "_comment": "When From: is unknown/missing, classify by subject/body context",
+    "projectKeywords": [
+      "KRC 118",
+      "WS193",
+      "PROPOSTA AMERINODE",
+      "AN DOMINICANA",
+      "Regularização",
+      "Telefônica",
+      "Claro",
+      "Amerinode",
+      "WS19340"
+    ],
+    "matchResult": "Important",
+    "threadReplyResult": "Important",
+    "defaultFallback": "Respond",
+    "neverAutoSpam": true
+  },
+
+  "spamAging": {
+    "_comment": "Emails in Spam older than 30 days are flagged [REVISAR] in the weekly Friday report",
+    "ageThresholdDays": 30,
+    "flag": "[REVISAR]",
+    "reportDay": "Friday",
+    "reportTime": "16:00"
+  }
+}

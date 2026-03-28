@@ -22,8 +22,13 @@ config/google-tts-credentials.json
 *.log
 logs/
 temp/
+temp_*
+tmp-*
 uploads/
 session.json
+
+# Scratch notes
+restart bot.txt
 
 # OS
 .DS_Store

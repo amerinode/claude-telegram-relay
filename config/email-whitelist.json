@@ -1,0 +1,6 @@
+{
+  "description": "Emails from these senders/domains will NEVER be moved to Potential Spam",
+  "whitelist": [
+    "ellie@skywardtel.com"
+  ]
+}

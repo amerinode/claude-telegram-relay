@@ -282,7 +282,6 @@ async function getOnlineMeetingByJoinUrl(joinUrl: string): Promise<string | null
     const data = await graphRequest("/me/onlineMeetings", {
       params: {
         $filter: `JoinWebUrl eq '${joinUrl}'`,
-        $select: "id",
       },
     }) as { value: any[] };
     return data.value?.[0]?.id || null;
@@ -298,7 +297,7 @@ async function getOnlineMeetingByJoinUrl(joinUrl: string): Promise<string | null
 async function listMeetingTranscripts(onlineMeetingId: string): Promise<TranscriptInfo[]> {
   const data = await graphRequest(
     `/me/onlineMeetings/${onlineMeetingId}/transcripts`,
-    { params: { $select: "id,meetingId,createdDateTime" } }
+    {}
   ) as { value: any[] };
 
   return (data.value || []).map((t: any) => ({
